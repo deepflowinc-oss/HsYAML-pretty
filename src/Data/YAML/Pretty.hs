@@ -16,6 +16,8 @@ module Data.YAML.Pretty (
   parserOnly,
   orParse,
   asumParsers,
+  (<!>),
+  eitherCodec,
   Context (..),
   encode,
   encodeWith,
@@ -30,6 +32,9 @@ module Data.YAML.Pretty (
   dimapMaybe,
   maybeCodec,
   divideCodec,
+  prod,
+  prodWith,
+  elem,
   json,
   null,
   bool,
@@ -67,7 +72,7 @@ module Data.YAML.Pretty (
 ) where
 
 import Control.Applicative
-import Control.Lens (Fold, (^?), _2, _3)
+import Control.Lens hiding (Context)
 import Control.Monad ((<=<))
 import Data.Aeson (FromJSON, ToJSON)
 import Data.Aeson qualified as J
@@ -87,10 +92,12 @@ import Data.Kind (Type)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Pointed (Pointed (..))
-import Data.Profunctor
 import Data.Scientific (FPFormat (..), Scientific, formatScientific, fromFloatDigits, toRealFloat)
 import Data.Text qualified as T
 import Data.Text.Lazy qualified as LT
+import Data.Tuple
+import Data.Type.Bool
+import Data.Type.Equality
 import Data.Vector qualified as V
 import Data.Vector.Primitive qualified as P
 import Data.Vector.Storable qualified as S
@@ -102,7 +109,8 @@ import Data.YAML qualified as Y
 import Data.YAML.Event
 import GHC.Generics
 import Numeric.Natural (Natural)
-import Prelude hiding (null)
+import Prelude hiding (elem, null)
+import Prelude qualified hiding (elem)
 
 data Context = Value | Object | Product
   deriving (Show, Eq, Ord)
@@ -299,10 +307,16 @@ data Codec context input output where
     !(Codec Value v v) ->
     Codec Object (Maybe v) (Maybe v)
   ApCodec ::
-    Codec Object input (output -> output') ->
-    Codec Object input output ->
-    Codec Object input output'
+    (((context == Object) || (context == Product)) ~ 'True) =>
+    Codec context input (output -> output') ->
+    Codec context input output ->
+    Codec context input output'
+  ElementCodec ::
+    Codec Value input output ->
+    Codec Product input output
+  ProductCodec :: NodeStyle -> Codec Product i o -> Codec Value i o
   AltCodec ::
+    ((context == Product) ~ 'False) =>
     Codec context input output ->
     Codec context input' output' ->
     Codec context (Either input input') (Either output output')
@@ -311,13 +325,20 @@ data Codec context input output where
     (output -> Either String output') ->
     Codec context input output ->
     Codec context input' output'
+  Fail :: String -> Codec context Void a
   DivideCodec ::
+    ((context == Product) ~ 'False) =>
     (input -> (a, b)) ->
     Codec context a output ->
     Codec context b output ->
     Codec context input output
 
-divideCodec :: (input -> (a, b)) -> Codec context a output -> Codec context b output -> Codec context input output
+divideCodec ::
+  ((context == Product) ~ 'False) =>
+  (input -> (a, b)) ->
+  Codec context a output ->
+  Codec context b output ->
+  Codec context input output
 divideCodec = DivideCodec
 
 instance Pointed (Codec context i) where
@@ -328,9 +349,32 @@ instance Functor (Codec context input) where
   fmap f (DiMapCodec i o x) = DiMapCodec i (fmap f . o) x
   fmap f x = DiMapCodec id (Right . f) x
 
-instance (context ~ Object) => Applicative (Codec context input) where
+instance
+  (((context == Object) || (context == Product)) ~ True) =>
+  Applicative (Codec context input)
+  where
   pure = PureCodec
   (<*>) = ApCodec
+
+instance (context ~ Object, v ~ Void) => Alternative (Codec context v) where
+  empty = Fail "empty"
+  l <|> r = dimap absurd (either id id) (AltCodec l r)
+
+infixl 3 <!>
+
+(<!>) ::
+  ((context == Product) ~ 'False) =>
+  Codec context input output ->
+  Codec context input' output ->
+  Codec context (Either input input') output
+l <!> r = either id id <$> AltCodec l r
+
+eitherCodec ::
+  ((context == Product) ~ 'False) =>
+  Codec context input output ->
+  Codec context input' output' ->
+  Codec context (Either input input') (Either output output')
+eitherCodec = AltCodec
 
 instance Profunctor (Codec context) where
   dimap i o (PureCodec x) = DiMapCodec i Right $ PureCodec $ o x
@@ -341,18 +385,24 @@ parserOnly :: Codec context i o -> Codec context Void o
 parserOnly = lmap absurd
 
 asumParsers ::
-  (Foldable t) =>
+  (Foldable t, (context == Product) ~ 'False) =>
   Codec context i o ->
   t (Codec context Void o) ->
   Codec context i o
 asumParsers = foldl' orParse
 
-orParse :: Codec context i o -> Codec context Void o -> Codec context i o
+orParse :: ((context == Product) ~ 'False) => Codec context i o -> Codec context Void o -> Codec context i o
 orParse main alt =
   dimap Left (either id id) $ AltCodec main alt
 
 json :: (FromJSON a, ToJSON a) => Codec Value a a
 json = DiMapCodec J.toJSON (eitherResult . J.fromJSON) $ ViaJSON defaultValueFormatters
+
+prodWith :: NodeStyle -> Codec 'Product i o -> Codec 'Value i o
+prodWith = ProductCodec
+
+prod :: Codec 'Product i o -> Codec 'Value i o
+prod = ProductCodec Flow
 
 null :: Codec 'Value () ()
 null = NullCodec
@@ -396,6 +446,7 @@ encodeWith codec = writeEventsText . DL.toList . encodeWith_ codec
 
 encodeWith_ :: Codec o a x -> a -> DEvStream
 encodeWith_ PureCodec {} _ = mempty
+encodeWith_ (Fail _) x = absurd x
 encodeWith_ (AltCodec el _) (Left l) = encodeWith_ el l
 encodeWith_ (AltCodec _ er) (Right r) = encodeWith_ er r
 encodeWith_ (ViaJSON !opts) a = go a
@@ -426,6 +477,12 @@ encodeWith_ (ArrayCodec opts v) p =
   DL.singleton (SequenceStart Nothing untagged opts.style)
     <> foldMap (encodeWith_ v) p
     <> DL.singleton SequenceEnd
+encodeWith_ (ProductCodec opt v) p =
+  DL.singleton
+    (SequenceStart Nothing untagged opt)
+    <> encodeWith_ v p
+    <> DL.singleton SequenceEnd
+encodeWith_ (ElementCodec a) x = encodeWith_ a x
 encodeWith_ (DiMapCodec f _ a) x =
   encodeWith_ a (f x)
 encodeWith_ (DivideCodec f cl cr) x =
@@ -481,6 +538,7 @@ valueFromNode_ ::
   Codec Value i a ->
   Node loc ->
   Either (loc, String) a
+valueFromNode_ (Fail msg) x = Left (posOf x, msg)
 valueFromNode_ (PureCodec a) _ = pure a
 valueFromNode_ (AltCodec el er) v =
   case valueFromNode_ el v of
@@ -506,10 +564,32 @@ valueFromNode_ (ArrayCodec _ p) v =
     )
     . V.fromList
     =<< expect "array" (#_Sequence . _3) v
+valueFromNode_ (ProductCodec _ x) v =
+  (\(a, p) -> if Prelude.null p then pure a else Left (posOf v, "Invalid length of tuple"))
+    =<< (\(loc, _, p) -> productFromNode_ loc x p)
+    =<< expect "array" #_Sequence v
 valueFromNode_ (DiMapCodec _ o p) v =
   Bi.first (posOf v,) . o =<< valueFromNode_ p v
 valueFromNode_ (DivideCodec _ _ cr) v =
   valueFromNode_ cr v
+
+productFromNode_ ::
+  (Show loc) =>
+  loc ->
+  Codec 'Product i a ->
+  [Node loc] ->
+  Either (loc, String) (a, [Node loc])
+productFromNode_ loc (Fail msg) _ = Left (loc, msg)
+productFromNode_ loc (DiMapCodec _ r v) xs =
+  productFromNode_ loc v xs >>= \(a, rest) ->
+    Bi.bimap (loc,) (,rest) $ r a
+productFromNode_ _ (PureCodec v) xs = pure (v, xs)
+productFromNode_ _ (ElementCodec v) (x : xs) = (,xs) <$> valueFromNode_ v x
+productFromNode_ loc (ElementCodec _) [] = Left (loc, "Insufficient length of tuple")
+productFromNode_ loc (ApCodec l r) xs = do
+  (f, rest) <- productFromNode_ loc l xs
+  (x, rest') <- productFromNode_ loc r rest
+  pure (f x, rest')
 
 nodeToJSON :: (Show loc) => Node loc -> Either (loc, String) J.Value
 nodeToJSON = \case
@@ -580,6 +660,7 @@ objectFromNode_ ::
   Map T.Text (Node loc) ->
   Either (loc, String) a
 objectFromNode_ _ (PureCodec x) _ = pure x
+objectFromNode_ loc (Fail msg) _ = Left (loc, msg)
 objectFromNode_ pos (AltCodec el er) dic =
   case objectFromNode_ pos (Left <$> el) dic of
     Right v -> pure v
@@ -667,6 +748,55 @@ instance (HasValueCodec a, P.Prim a) => HasValueCodec (P.Vector a) where
 
 instance (HasValueCodec a) => HasValueCodec (Maybe a) where
   valueCodec = maybeCodec valueCodec
+
+instance (HasValueCodec a) => HasValueCodec (Solo a) where
+  valueCodec = dimap Solo (\(Solo v) -> v) valueCodec
+
+instance (HasValueCodec a, HasValueCodec b) => HasValueCodec (a, b) where
+  valueCodec =
+    prod $
+      (,)
+        <$> lmap fst (elem valueCodec)
+        <*> lmap snd (elem valueCodec)
+
+instance
+  (HasValueCodec a, HasValueCodec b, HasValueCodec c) =>
+  HasValueCodec (a, b, c)
+  where
+  valueCodec =
+    prod $
+      (,,)
+        <$> lmap (view _1) (elem valueCodec)
+        <*> lmap (view _2) (elem valueCodec)
+        <*> lmap (view _3) (elem valueCodec)
+
+instance
+  (HasValueCodec a, HasValueCodec b, HasValueCodec c, HasValueCodec d) =>
+  HasValueCodec (a, b, c, d)
+  where
+  valueCodec =
+    prod $
+      (,,,)
+        <$> lmap (view _1) (elem valueCodec)
+        <*> lmap (view _2) (elem valueCodec)
+        <*> lmap (view _3) (elem valueCodec)
+        <*> lmap (view _4) (elem valueCodec)
+
+instance
+  (HasValueCodec a, HasValueCodec b, HasValueCodec c, HasValueCodec d, HasValueCodec e) =>
+  HasValueCodec (a, b, c, d, e)
+  where
+  valueCodec =
+    prod $
+      (,,,,)
+        <$> lmap (view _1) (elem valueCodec)
+        <*> lmap (view _2) (elem valueCodec)
+        <*> lmap (view _3) (elem valueCodec)
+        <*> lmap (view _4) (elem valueCodec)
+        <*> lmap (view _5) (elem valueCodec)
+
+elem :: Codec 'Value input output -> Codec 'Product input output
+elem = ElementCodec
 
 maybeCodec :: Codec Value i o -> Codec Value (Maybe i) (Maybe o)
 maybeCodec codec = dimap (maybe (Right ()) Left) (either Just (const Nothing)) $ AltCodec codec null
