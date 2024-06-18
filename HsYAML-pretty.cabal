@@ -59,6 +59,7 @@ library
     dlist,
     generic-lens,
     lens,
+    pointed,
     profunctors,
     scientific,
     text,

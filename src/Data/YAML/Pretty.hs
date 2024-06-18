@@ -1,3 +1,4 @@
+{-# LANGUAGE ApplicativeDo #-}
 {-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DerivingStrategies #-}
@@ -12,19 +13,28 @@
 
 module Data.YAML.Pretty (
   Codec (..),
+  parserOnly,
+  orParse,
+  asumParsers,
   Context (..),
-  encodeYAMLWith,
+  encode,
+  encodeWith,
   fromNodeWith,
   fmapEither,
   fmapMaybe,
+  decode1,
   decode1With,
+  decode1Strict,
   decode1StrictWith,
   dimapEither,
   dimapMaybe,
+  maybeCodec,
   divideCodec,
   json,
   null,
   bool,
+  text,
+  textWith,
   FloatFormatter (..),
   defaultFloatFormatter,
   scientific,
@@ -53,8 +63,10 @@ module Data.YAML.Pretty (
   optionalField',
   ValueFormatters (..),
   defaultValueFormatters,
+  HasValueCodec (..),
 ) where
 
+import Control.Applicative
 import Control.Lens (Fold, (^?), _2, _3)
 import Control.Monad ((<=<))
 import Data.Aeson (FromJSON, ToJSON)
@@ -68,22 +80,31 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as LBS
 import Data.DList (DList)
 import Data.DList qualified as DL
+import Data.Foldable (foldl')
 import Data.Generics.Labels ()
+import Data.Int
 import Data.Kind (Type)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Pointed (Pointed (..))
 import Data.Profunctor
 import Data.Scientific (FPFormat (..), Scientific, formatScientific, fromFloatDigits, toRealFloat)
 import Data.Text qualified as T
 import Data.Text.Lazy qualified as LT
 import Data.Vector qualified as V
+import Data.Vector.Primitive qualified as P
+import Data.Vector.Storable qualified as S
+import Data.Vector.Unboxed qualified as U
+import Data.Void (Void, absurd)
+import Data.Word
 import Data.YAML (Node, Scalar (..))
 import Data.YAML qualified as Y
 import Data.YAML.Event
-import GHC.Generics (Generic)
+import GHC.Generics
+import Numeric.Natural (Natural)
 import Prelude hiding (null)
 
-data Context = Value | Object
+data Context = Value | Object | Product
   deriving (Show, Eq, Ord)
 
 data FloatFormatter = FloatFormatter {format :: !FPFormat, places :: !(Maybe Int)}
@@ -149,6 +170,12 @@ defaultTextFormatter = Plain
 
 bool :: Codec 'Value Bool Bool
 bool = BoolCodec
+
+textWith :: TextFormatter -> Codec 'Value T.Text T.Text
+textWith = TextCodec
+
+text :: Codec 'Value T.Text T.Text
+text = textWith defaultTextFormatter
 
 scientific :: Codec 'Value Scientific Scientific
 scientific = FloatCodec defaultFloatFormatter
@@ -275,6 +302,10 @@ data Codec context input output where
     Codec Object input (output -> output') ->
     Codec Object input output ->
     Codec Object input output'
+  AltCodec ::
+    Codec context input output ->
+    Codec context input' output' ->
+    Codec context (Either input input') (Either output output')
   DiMapCodec ::
     (input' -> input) ->
     (output -> Either String output') ->
@@ -289,6 +320,9 @@ data Codec context input output where
 divideCodec :: (input -> (a, b)) -> Codec context a output -> Codec context b output -> Codec context input output
 divideCodec = DivideCodec
 
+instance Pointed (Codec context i) where
+  point = PureCodec
+
 instance Functor (Codec context input) where
   fmap f (PureCodec x) = PureCodec (f x)
   fmap f (DiMapCodec i o x) = DiMapCodec i (fmap f . o) x
@@ -302,6 +336,20 @@ instance Profunctor (Codec context) where
   dimap i o (PureCodec x) = DiMapCodec i Right $ PureCodec $ o x
   dimap i o (DiMapCodec i' o' x) = DiMapCodec (i' . i) (fmap o . o') x
   dimap i o x = DiMapCodec i (Right . o) x
+
+parserOnly :: Codec context i o -> Codec context Void o
+parserOnly = lmap absurd
+
+asumParsers ::
+  (Foldable t) =>
+  Codec context i o ->
+  t (Codec context Void o) ->
+  Codec context i o
+asumParsers = foldl' orParse
+
+orParse :: Codec context i o -> Codec context Void o -> Codec context i o
+orParse main alt =
+  dimap Left (either id id) $ AltCodec main alt
 
 json :: (FromJSON a, ToJSON a) => Codec Value a a
 json = DiMapCodec J.toJSON (eitherResult . J.fromJSON) $ ViaJSON defaultValueFormatters
@@ -340,11 +388,16 @@ intEvt Base10 = Scalar Nothing untagged Plain . T.pack . show
 textEvt :: TextFormatter -> T.Text -> Event
 textEvt = Scalar Nothing untagged
 
-encodeYAMLWith :: Codec Value a x -> a -> LT.Text
-encodeYAMLWith codec = writeEventsText . DL.toList . encodeWith_ codec
+encode :: (HasValueCodec a) => a -> LT.Text
+encode = encodeWith valueCodec
+
+encodeWith :: Codec Value a x -> a -> LT.Text
+encodeWith codec = writeEventsText . DL.toList . encodeWith_ codec
 
 encodeWith_ :: Codec o a x -> a -> DEvStream
 encodeWith_ PureCodec {} _ = mempty
+encodeWith_ (AltCodec el _) (Left l) = encodeWith_ el l
+encodeWith_ (AltCodec _ er) (Right r) = encodeWith_ er r
 encodeWith_ (ViaJSON !opts) a = go a
   where
     go = \case
@@ -429,6 +482,10 @@ valueFromNode_ ::
   Node loc ->
   Either (loc, String) a
 valueFromNode_ (PureCodec a) _ = pure a
+valueFromNode_ (AltCodec el er) v =
+  case valueFromNode_ el v of
+    Right x -> Right (Left x)
+    Left {} -> valueFromNode_ (Right <$> er) v
 valueFromNode_ (ViaJSON _) v = nodeToJSON v
 valueFromNode_ NullCodec v
   | Y.Scalar _ Y.SNull <- v = pure ()
@@ -495,6 +552,12 @@ posOf (Y.Sequence loc _ _) = loc
 posOf (Y.Mapping loc _ _) = loc
 posOf (Y.Anchor loc _ _) = loc
 
+decode1 ::
+  (HasValueCodec a) =>
+  LBS.ByteString ->
+  Either (Pos, String) a
+decode1 = decode1With valueCodec
+
 decode1With ::
   Codec Value a output ->
   LBS.ByteString ->
@@ -507,6 +570,9 @@ decode1StrictWith ::
   Either (Pos, String) output
 decode1StrictWith codec = fromNodeWith codec <=< Y.decode1Strict
 
+decode1Strict :: (HasValueCodec a) => BS.ByteString -> Either (Pos, String) a
+decode1Strict = decode1StrictWith valueCodec
+
 objectFromNode_ ::
   (Show loc) =>
   loc ->
@@ -514,6 +580,10 @@ objectFromNode_ ::
   Map T.Text (Node loc) ->
   Either (loc, String) a
 objectFromNode_ _ (PureCodec x) _ = pure x
+objectFromNode_ pos (AltCodec el er) dic =
+  case objectFromNode_ pos (Left <$> el) dic of
+    Right v -> pure v
+    Left {} -> objectFromNode_ pos (Right <$> er) dic
 objectFromNode_ pos (RequiredFieldCodec f _ mdef v) dic =
   case Map.lookup f dic of
     Just x -> valueFromNode_ v x
@@ -528,3 +598,75 @@ objectFromNode_ pos (DiMapCodec _ o p) dic =
   Bi.first (pos,) . o =<< objectFromNode_ pos p dic
 objectFromNode_ pos (DivideCodec _ _ cr) dic =
   objectFromNode_ pos cr dic
+
+class HasValueCodec a where
+  valueCodec :: Codec Value a a
+
+instance HasValueCodec Word where
+  valueCodec = integral
+
+instance HasValueCodec Word64 where
+  valueCodec = integral
+
+instance HasValueCodec Word32 where
+  valueCodec = integral
+
+instance HasValueCodec Word16 where
+  valueCodec = integral
+
+instance HasValueCodec Word8 where
+  valueCodec = integral
+
+instance HasValueCodec Int where
+  valueCodec = integral
+
+instance HasValueCodec Int64 where
+  valueCodec = integral
+
+instance HasValueCodec Int32 where
+  valueCodec = integral
+
+instance HasValueCodec Int16 where
+  valueCodec = integral
+
+instance HasValueCodec Int8 where
+  valueCodec = integral
+
+instance HasValueCodec Natural where
+  valueCodec = integral
+
+instance HasValueCodec Double where
+  valueCodec = float
+
+instance HasValueCodec Float where
+  valueCodec = float
+
+instance HasValueCodec T.Text where
+  valueCodec = text
+
+instance HasValueCodec LT.Text where
+  valueCodec = dimap LT.toStrict LT.fromStrict text
+
+instance {-# OVERLAPPING #-} HasValueCodec String where
+  valueCodec = dimap T.pack T.unpack text
+
+instance {-# OVERLAPPABLE #-} (HasValueCodec a) => HasValueCodec [a] where
+  valueCodec = dimap V.fromList V.toList $ arrayOf valueCodec
+
+instance (HasValueCodec a) => HasValueCodec (V.Vector a) where
+  valueCodec = arrayOf valueCodec
+
+instance (HasValueCodec a, U.Unbox a) => HasValueCodec (U.Vector a) where
+  valueCodec = dimap U.convert (U.convert @V.Vector) valueCodec
+
+instance (HasValueCodec a, S.Storable a) => HasValueCodec (S.Vector a) where
+  valueCodec = dimap U.convert (U.convert @V.Vector) valueCodec
+
+instance (HasValueCodec a, P.Prim a) => HasValueCodec (P.Vector a) where
+  valueCodec = dimap U.convert (U.convert @V.Vector) valueCodec
+
+instance (HasValueCodec a) => HasValueCodec (Maybe a) where
+  valueCodec = maybeCodec valueCodec
+
+maybeCodec :: Codec Value i o -> Codec Value (Maybe i) (Maybe o)
+maybeCodec codec = dimap (maybe (Right ()) Left) (either Just (const Nothing)) $ AltCodec codec null
