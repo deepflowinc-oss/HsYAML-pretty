@@ -2,6 +2,7 @@
 {-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
@@ -9,10 +10,14 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE RoleAnnotations #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
 module Data.YAML.Pretty (
   Codec (..),
+  genericCodec,
   parserOnly,
   orParse,
   asumParsers,
@@ -40,6 +45,8 @@ module Data.YAML.Pretty (
   bool,
   text,
   textWith,
+  literalText,
+  literalTextWith,
   FloatFormatter (..),
   defaultFloatFormatter,
   scientific,
@@ -83,6 +90,7 @@ import Data.Bitraversable qualified as Bi
 import Data.Bits (Bits, toIntegralSized)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as LBS
+import Data.Coerce (coerce)
 import Data.DList (DList)
 import Data.DList qualified as DL
 import Data.Foldable (foldl')
@@ -92,6 +100,7 @@ import Data.Kind (Type)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Pointed (Pointed (..))
+import Data.Proxy (Proxy (..))
 import Data.Scientific (FPFormat (..), Scientific, formatScientific, fromFloatDigits, toRealFloat)
 import Data.Text qualified as T
 import Data.Text.Lazy qualified as LT
@@ -108,6 +117,8 @@ import Data.YAML (Node, Scalar (..))
 import Data.YAML qualified as Y
 import Data.YAML.Event
 import GHC.Generics
+import GHC.Generics qualified as G
+import GHC.TypeLits (KnownSymbol, symbolVal)
 import Numeric.Natural (Natural)
 import Prelude hiding (elem, null)
 import Prelude qualified hiding (elem)
@@ -184,6 +195,12 @@ textWith = TextCodec
 
 text :: Codec 'Value T.Text T.Text
 text = textWith defaultTextFormatter
+
+literalTextWith :: TextFormatter -> T.Text -> Codec 'Value () ()
+literalTextWith = FixedTextCodec
+
+literalText :: T.Text -> Codec 'Value () ()
+literalText = literalTextWith Plain
 
 scientific :: Codec 'Value Scientific Scientific
 scientific = FloatCodec defaultFloatFormatter
@@ -280,6 +297,7 @@ data Codec context input output where
   FloatCodec :: !FloatFormatter -> Codec Value Scientific Scientific
   IntCodec :: !IntegerFormatter -> Codec Value Integer Integer
   TextCodec :: !ScalarStyle -> Codec Value T.Text T.Text
+  FixedTextCodec :: !TextFormatter -> !T.Text -> Codec Value () ()
   ObjectCodec ::
     !ObjectFormatter ->
     Codec Object i o ->
@@ -442,10 +460,11 @@ encode :: (HasValueCodec a) => a -> LT.Text
 encode = encodeWith valueCodec
 
 encodeWith :: Codec Value a x -> a -> LT.Text
-encodeWith codec = writeEventsText . DL.toList . encodeWith_ codec
+encodeWith codec = writeEventsText . DL.toList . (DL.fromList [StreamStart, DocumentStart NoDirEndMarker] <>) . (<> DL.fromList [DocumentEnd False, StreamEnd]) . encodeWith_ codec
 
 encodeWith_ :: Codec o a x -> a -> DEvStream
 encodeWith_ PureCodec {} _ = mempty
+encodeWith_ (FixedTextCodec sty t) () = DL.singleton $ textEvt sty t
 encodeWith_ (Fail _) x = absurd x
 encodeWith_ (AltCodec el _) (Left l) = encodeWith_ el l
 encodeWith_ (AltCodec _ er) (Right r) = encodeWith_ er r
@@ -552,6 +571,7 @@ valueFromNode_ BoolCodec v = expectScalar "bool" #_SBool v
 valueFromNode_ FloatCodec {} v = expectScalar "float" #_SFloat v
 valueFromNode_ IntCodec {} v = expectScalar "integer" #_SInt v
 valueFromNode_ TextCodec {} v = expectScalar "bool" #_SStr v
+valueFromNode_ (FixedTextCodec _ t) v = expectScalar (T.unpack t) (#_SStr . only t) v
 valueFromNode_ (ObjectCodec _ p) v =
   objectFromNode_ (posOf v) p . Map.fromList
     =<< mapM (Bi.bitraverse (valueFromNode_ (TextCodec Plain)) pure) . Map.toList
@@ -800,3 +820,127 @@ elem = ElementCodec
 
 maybeCodec :: Codec Value i o -> Codec Value (Maybe i) (Maybe o)
 maybeCodec codec = dimap (maybe (Right ()) Left) (either Just (const Nothing)) $ AltCodec codec null
+
+class GHasValueCodec f where
+  gvalueCodec :: Codec Value (f ()) (f ())
+
+class GHasProductCodec f where
+  gprodCodec :: Codec Product (f ()) (f ())
+
+instance GHasProductCodec U1 where
+  gprodCodec = pure U1
+
+instance
+  ( m ~ 'Nothing
+  , GHasValueCodec f
+  ) =>
+  GHasProductCodec (S1 ('MetaSel m x y z) f)
+  where
+  gprodCodec = elem $ dimap unM1 M1 gvalueCodec
+
+instance
+  (GHasProductCodec l, GHasProductCodec r) =>
+  GHasProductCodec (l :*: r)
+  where
+  gprodCodec =
+    (:*:)
+      <$> lmap (\(l :*: _) -> l) (gprodCodec @l)
+      <*> lmap (\(_ :*: r) -> r) (gprodCodec @r)
+
+class GHasObjectCodec f where
+  gobjCodec :: Codec Object (f ()) (f ())
+
+instance
+  {-# OVERLAPPING #-}
+  ( m ~ 'Just sel
+  , KnownSymbol sel
+  , HasValueCodec a
+  ) =>
+  GHasObjectCodec (S1 ('MetaSel m x y z) (K1 i (Maybe a)))
+  where
+  gobjCodec =
+    dimap (unK1 . unM1) (M1 . K1) $
+      optionalField' (T.pack $ symbolVal @sel Proxy) Nothing True (valueCodec @a)
+
+instance
+  (GHasObjectCodec l, GHasObjectCodec r) =>
+  GHasObjectCodec (l :*: r)
+  where
+  gobjCodec =
+    (:*:)
+      <$> lmap (\(l :*: _) -> l) (gobjCodec @l)
+      <*> lmap (\(_ :*: r) -> r) (gobjCodec @r)
+
+instance
+  {-# OVERLAPPABLE #-}
+  ( m ~ 'Just sel
+  , KnownSymbol sel
+  , HasValueCodec a
+  ) =>
+  GHasObjectCodec (S1 ('MetaSel m x y z) (K1 i a))
+  where
+  gobjCodec =
+    dimap (unK1 . unM1) (M1 . K1) $
+      requiredField' (T.pack $ symbolVal @sel Proxy) Nothing Nothing (valueCodec @a)
+
+instance (HasValueCodec c) => GHasValueCodec (K1 i c) where
+  gvalueCodec = dimap unK1 K1 valueCodec
+
+data ProdType = IsProd | IsObj
+
+data SProdType pt where
+  SIsProd :: SProdType IsProd
+  SIsObj :: SProdType IsObj
+
+class KnownProdType pt where
+  sProdType :: SProdType pt
+
+instance KnownProdType 'IsProd where
+  sProdType = SIsProd
+
+instance KnownProdType 'IsObj where
+  sProdType = SIsObj
+
+type family ProductType f where
+  ProductType (l :*: r) = ProductType l
+  ProductType (S1 (MetaSel ('Just _) _ _ _) _) = IsObj
+  ProductType (S1 (MetaSel 'Nothing _ _ _) _) = IsProd
+  ProductType U1 = IsProd
+
+type family GHasGoodContext pt where
+  GHasGoodContext IsProd = GHasProductCodec
+  GHasGoodContext IsObj = GHasObjectCodec
+
+instance {-# OVERLAPPABLE #-} (GHasValueCodec f) => GHasValueCodec (M1 i c f) where
+  gvalueCodec = dimap unM1 M1 gvalueCodec
+
+instance
+  ( GHasGoodContext (ProductType (l :*: r)) (l :*: r)
+  , KnownProdType (ProductType (l :*: r))
+  ) =>
+  GHasValueCodec (l :*: r)
+  where
+  gvalueCodec = case sProdType @(ProductType (l :*: r)) of
+    SIsProd -> prod gprodCodec
+    SIsObj -> objectWith defaultObjectFormatter gobjCodec
+
+instance {-# OVERLAPPING #-} (Constructor i) => GHasValueCodec (C1 i U1) where
+  gvalueCodec =
+    dimap (\(M1 U1) -> ()) (\() -> M1 U1) $
+      literalText $
+        T.pack $
+          conName (undefined :: C1 i U1 ())
+
+instance (GHasValueCodec l, GHasValueCodec r) => GHasValueCodec (l :+: r) where
+  gvalueCodec =
+    lmap (\case L1 x -> Left x; R1 y -> Right y) $
+      L1 <$> gvalueCodec <!> R1 <$> gvalueCodec
+
+instance
+  (GHasValueCodec (Rep x), Generic x) =>
+  HasValueCodec (Generically x)
+  where
+  valueCodec = dimap (\(Generically a) -> G.from a) (Generically . G.to) gvalueCodec
+
+genericCodec :: (GHasValueCodec (Rep a), Generic a) => Codec 'Value a a
+genericCodec = dimap Generically coerce valueCodec
