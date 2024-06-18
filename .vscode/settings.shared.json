@@ -1,0 +1,20 @@
+{
+  "emeraldwalk.runonsave": {
+    "commands": [
+      {
+        "cmd": "cabal-gild --io HsYAML-pretty.cabal",
+        "isAsync": true,
+        "match": "(\\.cabal|\\.l?hs|cabal\\.project|cabal\\.project\\.local)$"
+      }
+    ]
+  },
+  "git.ignoredRepositories": ["dist-newstyle/**"],
+  "[cabal]": {
+    "editor.defaultFormatter": null,
+    "editor.formatOnSave": false
+  },
+  "files.associations": {
+    "**/ci/configs/*.project": "cabal"
+  },
+  "haskell.formattingProvider": "fourmolu"
+}

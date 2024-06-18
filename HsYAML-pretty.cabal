@@ -1,0 +1,94 @@
+cabal-version: 3.0
+name: HsYAML-pretty
+version: 0.1.0.0
+description: Please see the README on GitHub at <https://github.com/deepflowinc/HsYAML-pretty#readme>
+homepage: https://github.com/deepflowinc/HsYAML-pretty#readme
+bug-reports: https://github.com/deepflowinc/HsYAML-pretty/issues
+author: DeepFlow, Inc.
+maintainer: DeepFlow, Inc.
+copyright: 2024 (c) DeepFlow, Inc.
+license: GPL-3.0-or-later
+license-file: LICENSE
+build-type: Simple
+tested-with:
+  ghc ==9.2.8
+  ghc ==9.4.8
+  ghc ==9.6.4
+  ghc ==9.8.1
+
+extra-source-files:
+  CHANGELOG.md
+  README.md
+
+source-repository head
+  type: git
+  location: https://github.com/deepflowinc/HsYAML-pretty
+
+common defaults
+  other-modules: Paths_HsYAML_pretty
+  autogen-modules: Paths_HsYAML_pretty
+  ghc-options:
+    -Wall
+    -Wcompat
+    -Widentities
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+    -Wmissing-export-lists
+    -Wmissing-home-modules
+    -Wpartial-fields
+    -Wredundant-constraints
+    -Wunused-packages
+
+  build-depends:
+    base >=4.7 && <5
+
+  default-language: GHC2021
+
+library
+  import: defaults
+  -- cabal-gild: discover src
+  exposed-modules: Data.YAML.Pretty
+  hs-source-dirs: src
+  build-depends:
+    HsYAML,
+    HsYAML-aeson,
+    aeson,
+    bytestring,
+    containers,
+    contravariant,
+    dlist,
+    generic-lens,
+    lens,
+    profunctors,
+    scientific,
+    text,
+    unordered-containers,
+    vector,
+
+executable HsYAML-pretty-exe
+  import: defaults
+  main-is: Main.hs
+  -- cabal-gild: discover app --exclude=app/Main.hs
+  other-modules:
+  hs-source-dirs: app
+  build-depends: HsYAML-pretty
+  ghc-options:
+    -threaded
+    -O2
+    -rtsopts
+    -with-rtsopts=-N
+
+test-suite HsYAML-pretty-test
+  import: defaults
+  type: exitcode-stdio-1.0
+  main-is: Test.hs
+  -- cabal-gild: discover test --exclude=test/Test.hs
+  other-modules:
+  hs-source-dirs: test
+  ghc-options:
+    -threaded
+    -O2
+    -rtsopts
+    -with-rtsopts=-N
+
+  build-depends: HsYAML-pretty
