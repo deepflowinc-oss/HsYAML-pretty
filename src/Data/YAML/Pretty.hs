@@ -23,6 +23,7 @@ module Data.YAML.Pretty (
   RequiredField (..),
   reqField',
   defaultReq,
+  abort,
   OptionalField (..),
   optField',
   defaultOpt,
@@ -428,6 +429,9 @@ instance
 
 instance (context ~ Object) => Monad (Codec context input) where
   mx >>= f = JoinCodec $ f <$> mx
+
+instance (context ~ Object) => MonadFail (Codec context Void) where
+  fail = Fail
 
 instance (context ~ Object, v ~ Void) => Alternative (Codec context v) where
   empty = Fail "empty"
@@ -1245,3 +1249,6 @@ selectCodec = SelectCodec
 
 instance (ctx ~ Object) => Selective (Codec ctx input) where
   select = selectCodec
+
+abort :: String -> Codec context Void a
+abort = Fail
