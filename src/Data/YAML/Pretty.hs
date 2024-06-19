@@ -22,8 +22,10 @@ module Data.YAML.Pretty (
   Codec (..),
   RequiredField (..),
   reqField',
+  defaultReq,
   OptionalField (..),
   optField',
+  defaultOpt,
   Options (..),
   GenericCodecDefault (..),
   genericKeyOrdering,
@@ -448,22 +450,28 @@ infixl 8 @=
 (@=) :: Codec v i o -> (i' -> i) -> Codec v i' o
 (@=) = flip lmap
 
-data RequiredField a l b = RequiredField
+data RequiredField b = RequiredField
   { description :: !(Maybe T.Text)
   , defaultValue :: !(Maybe b)
   }
   deriving (Show, Eq, Ord, Generic)
 
-data OptionalField a l = OptionalField
+defaultReq :: RequiredField a
+defaultReq = RequiredField {description = Nothing, defaultValue = Nothing}
+
+data OptionalField = OptionalField
   { description :: !(Maybe T.Text)
   , showNull :: !Bool
   }
   deriving (Show, Eq, Ord, Generic)
 
+defaultOpt :: OptionalField
+defaultOpt = OptionalField {description = Nothing, showNull = True}
+
 reqField' ::
   forall l a b.
   (GHC.HasField l a b, KnownSymbol l) =>
-  RequiredField a l b ->
+  RequiredField b ->
   Codec Value b b ->
   Codec Object a b
 reqField' RequiredField {..} =
@@ -473,28 +481,12 @@ reqField' RequiredField {..} =
 optField' ::
   forall l a b.
   (GHC.HasField l a (Maybe b), KnownSymbol l) =>
-  OptionalField a l ->
+  OptionalField ->
   Codec Value b b ->
   Codec Object a (Maybe b)
 optField' OptionalField {..} =
   lmap (GHC.getField @l)
     . optionalField' (T.pack $ symbolVal @l Proxy) description showNull
-
-instance
-  {-# OVERLAPPABLE #-}
-  ( GHC.HasField l a b
-  ) =>
-  IsLabel l (RequiredField a l b)
-  where
-  fromLabel = RequiredField {description = Nothing, defaultValue = Nothing}
-
-instance
-  {-# OVERLAPPABLE #-}
-  ( GHC.HasField l a (Maybe b)
-  ) =>
-  IsLabel l (OptionalField a l)
-  where
-  fromLabel = OptionalField {description = Nothing, showNull = True}
 
 prod :: Codec 'Product i o -> Codec 'Value i o
 prod = ProductCodec Flow
