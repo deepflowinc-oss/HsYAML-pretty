@@ -14,14 +14,20 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE NoFieldSelectors #-}
+{-# OPTIONS_GHC -Wno-partial-fields #-}
 
 module Data.YAML.Pretty (
   Codec (..),
+  ReqLabel (..),
+  reqLabel,
+  OptLabel (..),
+  optLabel,
   genericCodec,
   parserOnly,
   orParse,
   asumParsers,
   (<!>),
+  (@=),
   eitherCodec,
   Context (..),
   encode,
@@ -94,9 +100,11 @@ import Data.Coerce (coerce)
 import Data.DList (DList)
 import Data.DList qualified as DL
 import Data.Foldable (foldl')
+import Data.Function (on)
 import Data.Generics.Labels ()
 import Data.Int
 import Data.Kind (Type)
+import Data.List (sortBy)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Pointed (Pointed (..))
@@ -118,6 +126,8 @@ import Data.YAML qualified as Y
 import Data.YAML.Event
 import GHC.Generics
 import GHC.Generics qualified as G
+import GHC.OverloadedLabels
+import GHC.Records qualified as GHC
 import GHC.TypeLits (KnownSymbol, symbolVal)
 import Numeric.Natural (Natural)
 import Prelude hiding (elem, null)
@@ -419,6 +429,53 @@ json = DiMapCodec J.toJSON (eitherResult . J.fromJSON) $ ViaJSON defaultValueFor
 prodWith :: NodeStyle -> Codec 'Product i o -> Codec 'Value i o
 prodWith = ProductCodec
 
+infixl 8 @=
+
+(@=) :: Codec v i o -> (i' -> i) -> Codec v i' o
+(@=) = flip lmap
+
+data ReqLabel a
+  = Required
+  { description :: Maybe T.Text
+  , defaultValue :: !(Maybe a)
+  }
+  deriving (Show, Eq, Ord, Generic)
+
+data OptLabel
+  = Optional
+  { description :: Maybe T.Text
+  , showNull :: !Bool
+  }
+  deriving (Show, Eq, Ord, Generic)
+
+reqLabel :: ReqLabel a
+reqLabel = Required Nothing Nothing
+
+optLabel :: OptLabel
+optLabel = Optional Nothing False
+
+instance
+  {-# OVERLAPPABLE #-}
+  ( GHC.HasField l a b
+  , KnownSymbol l
+  ) =>
+  IsLabel l (ReqLabel b -> Codec Value b b -> Codec Object a b)
+  where
+  fromLabel Required {..} =
+    lmap (GHC.getField @l)
+      . requiredField' (T.pack $ symbolVal @l Proxy) description defaultValue
+
+instance
+  {-# OVERLAPPABLE #-}
+  ( GHC.HasField l a (Maybe b)
+  , KnownSymbol l
+  ) =>
+  IsLabel l (OptLabel -> Codec Value b b -> Codec Object a (Maybe b))
+  where
+  fromLabel Optional {..} =
+    lmap (GHC.getField @l)
+      . optionalField' (T.pack $ symbolVal @l Proxy) description showNull
+
 prod :: Codec 'Product i o -> Codec 'Value i o
 prod = ProductCodec Flow
 
@@ -462,7 +519,7 @@ encode = encodeWith valueCodec
 encodeWith :: Codec Value a x -> a -> LT.Text
 encodeWith codec = writeEventsText . DL.toList . (DL.fromList [StreamStart, DocumentStart NoDirEndMarker] <>) . (<> DL.fromList [DocumentEnd False, StreamEnd]) . encodeWith_ codec
 
-encodeWith_ :: Codec o a x -> a -> DEvStream
+encodeWith_ :: ((c == Object) ~ 'False) => Codec c i o -> i -> DEvStream
 encodeWith_ PureCodec {} _ = mempty
 encodeWith_ (FixedTextCodec sty t) () = DL.singleton $ textEvt sty t
 encodeWith_ (Fail _) x = absurd x
@@ -480,18 +537,16 @@ encodeWith_ (ViaJSON !opts) a = go a
           <> foldMap go v
           <> DL.singleton SequenceEnd
       J.Object o ->
-        DL.singleton (MappingStart Nothing untagged opts.array.style)
-          <> foldMap (\(f, v) -> DL.cons (Scalar Nothing untagged Plain $ AK.toText f) (go v)) (AKM.toList o)
-          <> DL.singleton MappingEnd
+        encodeObjLike opts.object go $
+          Map.mapKeys AK.toText $
+            AKM.toMap o
 encodeWith_ NullCodec () = DL.singleton nullEvt
 encodeWith_ BoolCodec p = DL.singleton $ boolEvt p
 encodeWith_ (FloatCodec opt) p = DL.singleton $ floatEvt opt p
 encodeWith_ (IntCodec opt) p = DL.singleton $ intEvt opt p
 encodeWith_ (TextCodec sty) p = DL.singleton $ textEvt sty p
 encodeWith_ (ObjectCodec opts v) p =
-  DL.singleton (MappingStart Nothing untagged opts.style)
-    <> encodeWith_ v p
-    <> DL.singleton MappingEnd
+  encodeObjLike opts id (encodeFieldMap v p)
 encodeWith_ (ArrayCodec opts v) p =
   DL.singleton (SequenceStart Nothing untagged opts.style)
     <> foldMap (encodeWith_ v) p
@@ -502,33 +557,53 @@ encodeWith_ (ProductCodec opt v) p =
     <> encodeWith_ v p
     <> DL.singleton SequenceEnd
 encodeWith_ (ElementCodec a) x = encodeWith_ a x
-encodeWith_ (DiMapCodec f _ a) x =
-  encodeWith_ a (f x)
+encodeWith_ (DiMapCodec f _ a) x = encodeWith_ a (f x)
 encodeWith_ (DivideCodec f cl cr) x =
   let (l, r) = f x
    in encodeWith_ cl l <> encodeWith_ cr r
 encodeWith_ (ApCodec f x) p =
   encodeWith_ f p <> encodeWith_ x p
-encodeWith_ (RequiredFieldCodec f mcomm _ v) p =
-  maybe id (DL.cons . Comment) mcomm $
-    Scalar Nothing untagged Plain f
-      `DL.cons` encodeWith_ v p
-encodeWith_ (OptionalFieldCodec f mcomm putNull v) p =
-  let withComm =
-        foldMap $
-          maybe
-            id
-            (DL.cons . Comment)
-            mcomm
-   in withComm $ case p of
-        Nothing
-          | putNull ->
-              Just $
-                Scalar Nothing untagged Plain f `DL.cons` DL.singleton nullEvt
-          | otherwise -> Nothing
-        Just x ->
-          Just $
-            Scalar Nothing untagged Plain f `DL.cons` encodeWith_ v x
+
+encodeFieldMap :: Codec 'Object a x -> a -> Map T.Text DEvStream
+encodeFieldMap = go mempty
+  where
+    go :: Map T.Text DEvStream -> Codec 'Object v x -> v -> Map T.Text DEvStream
+    go !acc PureCodec {} _ = acc
+    go !acc (ApCodec l r) a =
+      go (go acc l a) r a
+    go !acc (RequiredFieldCodec f mcomm _ v) p =
+      Map.insert
+        f
+        ( maybe id (DL.cons . Comment) mcomm $
+            encodeWith_ v p
+        )
+        acc
+    go !acc (OptionalFieldCodec f mcomm putNull v) p =
+      let withComm = maybe id (DL.cons . Comment) mcomm
+       in case p of
+            Nothing
+              | putNull -> Map.insert f (withComm $ DL.singleton nullEvt) acc
+              | otherwise -> acc
+            Just x -> Map.insert f (withComm $ encodeWith_ v x) acc
+    go !acc (AltCodec l _) (Left x) = go acc l x
+    go !acc (AltCodec _ r) (Right x) = go acc r x
+    go !acc (DiMapCodec l _ a) x = go acc a $ l x
+    go !_ (Fail _) x = absurd x
+    go !acc (DivideCodec f cl cr) x =
+      let (l, r) = f x
+       in go (go acc cl l) cr r
+
+encodeObjLike :: ObjectFormatter -> (a -> DEvStream) -> Map T.Text a -> DEvStream
+encodeObjLike opts go obj =
+  DL.singleton (MappingStart Nothing untagged opts.style)
+    <> foldMap
+      ( \(f, v) ->
+          DL.cons
+            (Scalar Nothing untagged Plain f)
+            (go v)
+      )
+      (sortBy (opts.keyOrdering `on` fst) $ Map.toList obj)
+    <> DL.singleton MappingEnd
 
 fromNodeWith :: Codec Value i a -> Node Pos -> Either (Pos, String) a
 fromNodeWith = valueFromNode_
