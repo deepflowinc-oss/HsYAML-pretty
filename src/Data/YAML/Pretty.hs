@@ -39,6 +39,7 @@ module Data.YAML.Pretty (
   decode1With,
   decode1Strict,
   decode1StrictWith,
+  dimap,
   dimapEither,
   dimapMaybe,
   maybeCodec,
