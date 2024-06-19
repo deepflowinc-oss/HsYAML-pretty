@@ -33,6 +33,8 @@ module Data.YAML.Pretty (
   defaultOptions,
   genericCodecWith,
   genericCodecDefaultWith,
+  genericObjectCodecWith,
+  genericObjectCodecDefaultWith,
   parserOnly,
   decodeEncode,
   orParse,
@@ -95,6 +97,7 @@ module Data.YAML.Pretty (
   optionalField',
   ValueFormatters (..),
   defaultValueFormatters,
+  HasObjectCodec (..),
   HasValueCodec (..),
   HasFieldSpec (..),
   FieldSpec (..),
@@ -845,6 +848,9 @@ objectFromNode_ pos (DivideCodec _ cl cr) dic =
 class HasValueCodec a where
   valueCodec :: Codec Value a a
 
+class HasObjectCodec a where
+  objectCodec :: Codec Object a a
+
 instance HasValueCodec Word where
   valueCodec = integral
 
@@ -1049,6 +1055,9 @@ instance
       <$> lmap (\(l :*: _) -> l) (gobjCodecWith p opts)
       <*> lmap (\(_ :*: r) -> r) (gobjCodecWith p opts)
 
+instance {-# OVERLAPPABLE #-} (GHasObjectCodec flav f) => GHasObjectCodec flav (M1 i c f) where
+  gobjCodecWith p = dimap unM1 M1 . gobjCodecWith p
+
 instance
   {-# OVERLAPPING #-}
   ( m ~ 'Just sel
@@ -1216,6 +1225,20 @@ genericCodecDefaultWith ::
   Codec 'Value a a
 genericCodecDefaultWith =
   dimap G.from G.to . gvalueCodecWith (proxy# @'WithDefault)
+
+genericObjectCodecWith ::
+  (GHasObjectCodec 'Simple (Rep a), Generic a) =>
+  Options ->
+  Codec 'Object a a
+genericObjectCodecWith =
+  dimap G.from G.to . gobjCodecWith (proxy# @'Simple)
+
+genericObjectCodecDefaultWith ::
+  (GHasObjectCodec 'WithDefault (Rep a), Generic a) =>
+  Options ->
+  Codec 'Object a a
+genericObjectCodecDefaultWith =
+  dimap G.from G.to . gobjCodecWith (proxy# @'WithDefault)
 
 selectCodec :: Codec 'Object input (Either a b) -> Codec 'Object input (a -> b) -> Codec 'Object input b
 selectCodec = SelectCodec
