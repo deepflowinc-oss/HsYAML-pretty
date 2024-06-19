@@ -34,6 +34,7 @@ module Data.YAML.Pretty (
   genericCodecWith,
   genericCodecDefaultWith,
   parserOnly,
+  decodeEncode,
   orParse,
   asumParsers,
   (<!>),
@@ -224,6 +225,14 @@ textWith = TextCodec
 
 text :: Codec 'Value T.Text T.Text
 text = textWith defaultTextFormatter
+
+decodeEncode ::
+  ((context == Product) ~ 'False) =>
+  Codec context Void o ->
+  Codec context i Void ->
+  Codec context i o
+decodeEncode p e =
+  dimap Right (either id absurd) $ AltCodec p e
 
 parseText :: T.Text -> (T.Text -> Either String output) -> Codec 'Value Void output
 parseText = ParseText
