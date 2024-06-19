@@ -6,6 +6,7 @@
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MagicHash #-}
 {-# LANGUAGE OverloadedLabels #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -83,6 +84,12 @@ module Data.YAML.Pretty (
   ValueFormatters (..),
   defaultValueFormatters,
   HasValueCodec (..),
+  HasFieldSpec (..),
+  FieldSpec (..),
+  reqFieldSpec,
+  optFieldSpec,
+  GenericCodecWithDefault (..),
+  genericCodecWithDefault,
 ) where
 
 import Control.Applicative
@@ -104,7 +111,7 @@ import Data.Foldable (foldl')
 import Data.Function (on)
 import Data.Generics.Labels ()
 import Data.Int
-import Data.Kind (Type)
+import Data.Kind (Constraint, Type)
 import Data.List (sortBy)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -125,6 +132,7 @@ import Data.Word
 import Data.YAML (Node, Scalar (..))
 import Data.YAML qualified as Y
 import Data.YAML.Event
+import GHC.Exts (Proxy#, proxy#)
 import GHC.Generics
 import GHC.Generics qualified as G
 import GHC.OverloadedLabels
@@ -897,34 +905,74 @@ elem = ElementCodec
 maybeCodec :: Codec Value i o -> Codec Value (Maybe i) (Maybe o)
 maybeCodec codec = dimap (maybe (Right ()) Left) (either Just (const Nothing)) $ AltCodec codec null
 
-class GHasValueCodec f where
-  gvalueCodec :: Codec Value (f ()) (f ())
+data Flavour = Simple | WithDefault
 
-class GHasProductCodec f where
-  gprodCodec :: Codec Product (f ()) (f ())
+type GHasValueCodec :: Flavour -> (Type -> Type) -> Constraint
+class GHasValueCodec flav f where
+  gvalueCodec :: Proxy# flav -> Codec Value (f ()) (f ())
 
-instance GHasProductCodec U1 where
-  gprodCodec = pure U1
+type GHasProductCodec :: Flavour -> (Type -> Type) -> Constraint
+class GHasProductCodec flav f where
+  gprodCodec :: Proxy# flav -> Codec Product (f ()) (f ())
+
+instance GHasProductCodec flav U1 where
+  gprodCodec _ = pure U1
 
 instance
   ( m ~ 'Nothing
-  , GHasValueCodec f
+  , GHasValueCodec flav f
   ) =>
-  GHasProductCodec (S1 ('MetaSel m x y z) f)
+  GHasProductCodec flav (S1 ('MetaSel m x y z) f)
   where
-  gprodCodec = elem $ dimap unM1 M1 gvalueCodec
+  gprodCodec _ = elem $ dimap unM1 M1 $ gvalueCodec (proxy# @flav)
 
 instance
-  (GHasProductCodec l, GHasProductCodec r) =>
-  GHasProductCodec (l :*: r)
+  (GHasProductCodec flav l, GHasProductCodec flav r) =>
+  GHasProductCodec flav (l :*: r)
   where
-  gprodCodec =
+  gprodCodec p =
     (:*:)
-      <$> lmap (\(l :*: _) -> l) (gprodCodec @l)
-      <*> lmap (\(_ :*: r) -> r) (gprodCodec @r)
+      <$> lmap (\(l :*: _) -> l) (gprodCodec p)
+      <*> lmap (\(_ :*: r) -> r) (gprodCodec p)
 
-class GHasObjectCodec f where
-  gobjCodec :: Codec Object (f ()) (f ())
+data FieldSpec a = FieldSpec
+  { description :: Maybe T.Text
+  , defaultValue :: Maybe a
+  , showNull :: Bool
+  }
+  deriving (Show, Eq, Ord, Generic)
+
+reqFieldSpec :: FieldSpec a
+reqFieldSpec =
+  FieldSpec
+    { description = Nothing
+    , defaultValue = Nothing
+    , showNull = False
+    }
+
+optFieldSpec :: FieldSpec a
+optFieldSpec =
+  FieldSpec
+    { description = Nothing
+    , defaultValue = Nothing
+    , showNull = True
+    }
+
+class HasFieldSpec a where
+  fieldSpec :: FieldSpec a
+
+type GHasObjectCodec :: Flavour -> (Type -> Type) -> Constraint
+class GHasObjectCodec flav f where
+  gobjCodec :: Proxy# flav -> Codec Object (f ()) (f ())
+
+instance
+  (GHasObjectCodec f l, GHasObjectCodec f r) =>
+  GHasObjectCodec f (l :*: r)
+  where
+  gobjCodec p =
+    (:*:)
+      <$> lmap (\(l :*: _) -> l) (gobjCodec p)
+      <*> lmap (\(_ :*: r) -> r) (gobjCodec p)
 
 instance
   {-# OVERLAPPING #-}
@@ -932,20 +980,11 @@ instance
   , KnownSymbol sel
   , HasValueCodec a
   ) =>
-  GHasObjectCodec (S1 ('MetaSel m x y z) (K1 i (Maybe a)))
+  GHasObjectCodec 'Simple (S1 ('MetaSel m x y z) (K1 i (Maybe a)))
   where
-  gobjCodec =
+  gobjCodec _ =
     dimap (unK1 . unM1) (M1 . K1) $
-      optionalField' (T.pack $ symbolVal @sel Proxy) Nothing True (valueCodec @a)
-
-instance
-  (GHasObjectCodec l, GHasObjectCodec r) =>
-  GHasObjectCodec (l :*: r)
-  where
-  gobjCodec =
-    (:*:)
-      <$> lmap (\(l :*: _) -> l) (gobjCodec @l)
-      <*> lmap (\(_ :*: r) -> r) (gobjCodec @r)
+      optionalField' (T.pack $ symbolVal @sel Proxy) Nothing True (valueCodec)
 
 instance
   {-# OVERLAPPABLE #-}
@@ -953,14 +992,42 @@ instance
   , KnownSymbol sel
   , HasValueCodec a
   ) =>
-  GHasObjectCodec (S1 ('MetaSel m x y z) (K1 i a))
+  GHasObjectCodec 'Simple (S1 ('MetaSel m x y z) (K1 i a))
   where
-  gobjCodec =
+  gobjCodec _ =
     dimap (unK1 . unM1) (M1 . K1) $
       requiredField' (T.pack $ symbolVal @sel Proxy) Nothing Nothing (valueCodec @a)
 
-instance (HasValueCodec c) => GHasValueCodec (K1 i c) where
-  gvalueCodec = dimap unK1 K1 valueCodec
+instance
+  {-# OVERLAPPING #-}
+  ( m ~ 'Just sel
+  , KnownSymbol sel
+  , HasValueCodec a
+  , HasFieldSpec a
+  ) =>
+  GHasObjectCodec WithDefault (S1 ('MetaSel m x y z) (K1 i (Maybe a)))
+  where
+  gobjCodec _ =
+    let FieldSpec {..} = fieldSpec @a
+     in dimap (unK1 . unM1) (M1 . K1) $
+          optionalField' (T.pack $ symbolVal @sel Proxy) description showNull (valueCodec @a)
+
+instance
+  {-# OVERLAPPING #-}
+  ( m ~ 'Just sel
+  , KnownSymbol sel
+  , HasValueCodec a
+  , HasFieldSpec a
+  ) =>
+  GHasObjectCodec WithDefault (S1 ('MetaSel m x y z) (K1 i a))
+  where
+  gobjCodec _ =
+    let FieldSpec {..} = fieldSpec @a
+     in dimap (unK1 . unM1) (M1 . K1) $
+          requiredField' (T.pack $ symbolVal @sel Proxy) description defaultValue (valueCodec @a)
+
+instance (HasValueCodec c) => GHasValueCodec flav (K1 i c) where
+  gvalueCodec _ = dimap unK1 K1 valueCodec
 
 data ProdType = IsProd | IsObj
 
@@ -983,40 +1050,52 @@ type family ProductType f where
   ProductType (S1 (MetaSel 'Nothing _ _ _) _) = IsProd
   ProductType U1 = IsProd
 
-type family GHasGoodContext pt where
-  GHasGoodContext IsProd = GHasProductCodec
-  GHasGoodContext IsObj = GHasObjectCodec
+type family GHasGoodContext mode pt where
+  GHasGoodContext mode IsProd = GHasProductCodec mode
+  GHasGoodContext mode IsObj = GHasObjectCodec mode
 
-instance {-# OVERLAPPABLE #-} (GHasValueCodec f) => GHasValueCodec (M1 i c f) where
-  gvalueCodec = dimap unM1 M1 gvalueCodec
+instance {-# OVERLAPPABLE #-} (GHasValueCodec mode f) => GHasValueCodec mode (M1 i c f) where
+  gvalueCodec p = dimap unM1 M1 $ gvalueCodec p
 
 instance
-  ( GHasGoodContext (ProductType (l :*: r)) (l :*: r)
+  ( GHasGoodContext mode (ProductType (l :*: r)) (l :*: r)
   , KnownProdType (ProductType (l :*: r))
   ) =>
-  GHasValueCodec (l :*: r)
+  GHasValueCodec mode (l :*: r)
   where
-  gvalueCodec = case sProdType @(ProductType (l :*: r)) of
-    SIsProd -> prod gprodCodec
-    SIsObj -> objectWith defaultObjectFormatter gobjCodec
+  gvalueCodec p = case sProdType @(ProductType (l :*: r)) of
+    SIsProd -> prod $ gprodCodec p
+    SIsObj -> objectWith defaultObjectFormatter $ gobjCodec p
 
-instance {-# OVERLAPPING #-} (Constructor i) => GHasValueCodec (C1 i U1) where
-  gvalueCodec =
+instance {-# OVERLAPPING #-} (Constructor i) => GHasValueCodec mode (C1 i U1) where
+  gvalueCodec _ =
     dimap (\(M1 U1) -> ()) (\() -> M1 U1) $
       literalText $
         T.pack $
           conName (undefined :: C1 i U1 ())
 
-instance (GHasValueCodec l, GHasValueCodec r) => GHasValueCodec (l :+: r) where
-  gvalueCodec =
+instance (GHasValueCodec mode l, GHasValueCodec mode r) => GHasValueCodec mode (l :+: r) where
+  gvalueCodec p =
     lmap (\case L1 x -> Left x; R1 y -> Right y) $
-      L1 <$> gvalueCodec <!> R1 <$> gvalueCodec
+      L1 <$> gvalueCodec p <!> R1 <$> gvalueCodec p
 
 instance
-  (GHasValueCodec (Rep x), Generic x) =>
+  (GHasValueCodec 'Simple (Rep x), Generic x) =>
   HasValueCodec (Generically x)
   where
-  valueCodec = dimap (\(Generically a) -> G.from a) (Generically . G.to) gvalueCodec
+  valueCodec = dimap (\(Generically a) -> G.from a) (Generically . G.to) $ gvalueCodec (proxy# @'Simple)
 
-genericCodec :: (GHasValueCodec (Rep a), Generic a) => Codec 'Value a a
+genericCodec :: (GHasValueCodec 'Simple (Rep a), Generic a) => Codec 'Value a a
 genericCodec = dimap Generically coerce valueCodec
+
+newtype GenericCodecWithDefault a = GenericCodecWithDefault a
+  deriving (Show, Eq, Ord)
+
+instance
+  (GHasValueCodec 'WithDefault (Rep x), Generic x) =>
+  HasValueCodec (GenericCodecWithDefault x)
+  where
+  valueCodec = dimap (\(GenericCodecWithDefault a) -> G.from a) (GenericCodecWithDefault . G.to) $ gvalueCodec (proxy# @'WithDefault)
+
+genericCodecWithDefault :: (GHasValueCodec 'WithDefault (Rep a), Generic a) => Codec 'Value a a
+genericCodecWithDefault = dimap GenericCodecWithDefault coerce valueCodec
