@@ -562,7 +562,13 @@ encode :: (HasValueCodec a) => a -> LT.Text
 encode = encodeWith valueCodec
 
 encodeWith :: Codec Value a x -> a -> LT.Text
-encodeWith codec = writeEventsText . DL.toList . (DL.fromList [StreamStart, DocumentStart NoDirEndMarker] <>) . (<> DL.fromList [DocumentEnd False, StreamEnd]) . encodeWith_ codec
+encodeWith codec = writeEventsText . adjustComment . DL.toList . (DL.fromList [StreamStart, DocumentStart NoDirEndMarker] <>) . (<> DL.fromList [DocumentEnd False, StreamEnd]) . encodeWith_ codec
+
+adjustComment :: [Event] -> [Event]
+adjustComment [] = []
+adjustComment (st@StreamStart {} : com@Comment {} : xs) =
+  com : adjustComment (st : xs)
+adjustComment (x : xs) = x : adjustComment xs
 
 encodeWith_ :: ((c == Object) ~ 'False) => Codec c i o -> i -> DEvStream
 encodeWith_ PureCodec {} _ = mempty
@@ -654,10 +660,10 @@ encodeObjLike opts go obj =
   DL.singleton (MappingStart Nothing untagged opts.style)
     <> foldMap
       ( \(f, (mcomm, v)) ->
-          DL.cons
-            (Scalar Nothing untagged Plain f)
-            (go v)
-            <> foldMap (DL.singleton . Comment . (" " <>)) mcomm
+          foldMap (DL.singleton . Comment . (" " <>)) mcomm
+            <> DL.cons
+              (Scalar Nothing untagged Plain f)
+              (go v)
       )
       (sortBy (opts.keyOrdering `on` fst) $ Map.toList obj)
     <> DL.singleton MappingEnd
