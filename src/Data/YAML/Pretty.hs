@@ -584,8 +584,9 @@ encodeWith_ (ViaJSON !opts) a = go a
           <> DL.singleton SequenceEnd
       J.Object o ->
         encodeObjLike opts.object go $
-          Map.mapKeys AK.toText $
-            AKM.toMap o
+          fmap (Nothing,) $
+            Map.mapKeys AK.toText $
+              AKM.toMap o
 encodeWith_ NullCodec () = DL.singleton nullEvt
 encodeWith_ BoolCodec p = DL.singleton $ boolEvt p
 encodeWith_ (FloatCodec opt) p = DL.singleton $ floatEvt opt p
@@ -610,10 +611,10 @@ encodeWith_ (DivideCodec f cl cr) x =
 encodeWith_ (ApCodec f x) p =
   encodeWith_ f p <> encodeWith_ x p
 
-encodeFieldMap :: Codec 'Object a x -> a -> Map T.Text DEvStream
+encodeFieldMap :: Codec 'Object a x -> a -> Map T.Text (Maybe T.Text, DEvStream)
 encodeFieldMap = fmap snd . go mempty
   where
-    go :: Map T.Text DEvStream -> Codec 'Object v x -> v -> (x, Map T.Text DEvStream)
+    go :: Map T.Text (Maybe T.Text, DEvStream) -> Codec 'Object v x -> v -> (x, Map T.Text (Maybe T.Text, DEvStream))
     go !acc (PureCodec x) _ = (x, acc)
     go !acc (JoinCodec x) a =
       let (x', acc') = go acc x a
@@ -623,21 +624,13 @@ encodeFieldMap = fmap snd . go mempty
           (x, acc'') = go acc' r a
        in (f x, acc'')
     go !acc (RequiredFieldCodec f mcomm _ v) p =
-      ( p
-      , Map.insert
-          f
-          ( maybe id (DL.cons . Comment) mcomm $
-              encodeWith_ v p
-          )
-          acc
-      )
+      (p, Map.insert f (mcomm, encodeWith_ v p) acc)
     go !acc (OptionalFieldCodec f mcomm putNull v) p =
-      let withComm = maybe id (DL.cons . Comment) mcomm
-          acc' = case p of
+      let acc' = case p of
             Nothing
-              | putNull -> Map.insert f (withComm $ DL.singleton nullEvt) acc
+              | putNull -> Map.insert f (mcomm, DL.singleton nullEvt) acc
               | otherwise -> acc
-            Just x -> Map.insert f (withComm $ encodeWith_ v x) acc
+            Just x -> Map.insert f (mcomm, encodeWith_ v x) acc
        in (p, acc')
     go !acc (AltCodec l _) (Left x) = Bi.first Left $ go acc l x
     go !acc (AltCodec _ r) (Right x) = Bi.first Right $ go acc r x
@@ -656,14 +649,15 @@ encodeFieldMap = fmap snd . go mempty
           (r', acc'') = go acc' cr r
        in ((l', r'), acc'')
 
-encodeObjLike :: ObjectFormatter -> (a -> DEvStream) -> Map T.Text a -> DEvStream
+encodeObjLike :: ObjectFormatter -> (a -> DEvStream) -> Map T.Text (Maybe T.Text, a) -> DEvStream
 encodeObjLike opts go obj =
   DL.singleton (MappingStart Nothing untagged opts.style)
     <> foldMap
-      ( \(f, v) ->
-          DL.cons
-            (Scalar Nothing untagged Plain f)
-            (go v)
+      ( \(f, (mcomm, v)) ->
+          maybe id (DL.cons . Comment) mcomm $
+            DL.cons
+              (Scalar Nothing untagged Plain f)
+              (go v)
       )
       (sortBy (opts.keyOrdering `on` fst) $ Map.toList obj)
     <> DL.singleton MappingEnd
