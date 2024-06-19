@@ -20,15 +20,15 @@
 
 module Data.YAML.Pretty (
   Codec (..),
-  ReqLabel (..),
-  reqLabel,
-  OptLabel (..),
+  RequiredField (..),
+  reqField',
+  OptionalField (..),
+  optField',
   Options (..),
   GenericCodecDefault (..),
   genericKeyOrdering,
   withKeyOrdering,
   defaultOptions,
-  optLabel,
   genericCodecWith,
   genericCodecDefaultWith,
   parserOnly,
@@ -448,47 +448,53 @@ infixl 8 @=
 (@=) :: Codec v i o -> (i' -> i) -> Codec v i' o
 (@=) = flip lmap
 
-data ReqLabel a
-  = Required
-  { description :: Maybe T.Text
-  , defaultValue :: !(Maybe a)
+data RequiredField a l b = RequiredField
+  { description :: !(Maybe T.Text)
+  , defaultValue :: !(Maybe b)
   }
   deriving (Show, Eq, Ord, Generic)
 
-data OptLabel
-  = Optional
-  { description :: Maybe T.Text
+data OptionalField a l = OptionalField
+  { description :: !(Maybe T.Text)
   , showNull :: !Bool
   }
   deriving (Show, Eq, Ord, Generic)
 
-reqLabel :: ReqLabel a
-reqLabel = Required Nothing Nothing
+reqField' ::
+  forall l a b.
+  (GHC.HasField l a b, KnownSymbol l) =>
+  RequiredField a l b ->
+  Codec Value b b ->
+  Codec Object a b
+reqField' RequiredField {..} =
+  lmap (GHC.getField @l)
+    . requiredField' (T.pack $ symbolVal @l Proxy) description defaultValue
 
-optLabel :: OptLabel
-optLabel = Optional Nothing False
+optField' ::
+  forall l a b.
+  (GHC.HasField l a (Maybe b), KnownSymbol l) =>
+  OptionalField a l ->
+  Codec Value b b ->
+  Codec Object a (Maybe b)
+optField' OptionalField {..} =
+  lmap (GHC.getField @l)
+    . optionalField' (T.pack $ symbolVal @l Proxy) description showNull
 
 instance
   {-# OVERLAPPABLE #-}
   ( GHC.HasField l a b
-  , KnownSymbol l
   ) =>
-  IsLabel l (ReqLabel b -> Codec Value b b -> Codec Object a b)
+  IsLabel l (RequiredField a l b)
   where
-  fromLabel Required {..} =
-    lmap (GHC.getField @l)
-      . requiredField' (T.pack $ symbolVal @l Proxy) description defaultValue
+  fromLabel = RequiredField {description = Nothing, defaultValue = Nothing}
 
 instance
   {-# OVERLAPPABLE #-}
   ( GHC.HasField l a (Maybe b)
-  , KnownSymbol l
   ) =>
-  IsLabel l (OptLabel -> Codec Value b b -> Codec Object a (Maybe b))
+  IsLabel l (OptionalField a l)
   where
-  fromLabel Optional {..} =
-    lmap (GHC.getField @l)
-      . optionalField' (T.pack $ symbolVal @l Proxy) description showNull
+  fromLabel = OptionalField {description = Nothing, showNull = True}
 
 prod :: Codec 'Product i o -> Codec 'Value i o
 prod = ProductCodec Flow
