@@ -1,3 +1,9 @@
 packages: *.cabal
 tests: True
 benchmarks: True
+
+source-repository-package
+  type: git
+  location: https://github.com/konn/HsYAML.git
+  tag: 62e4131e25b536d53acd7869c8bab6ef5fef0a4c
+
