@@ -654,10 +654,10 @@ encodeObjLike opts go obj =
   DL.singleton (MappingStart Nothing untagged opts.style)
     <> foldMap
       ( \(f, (mcomm, v)) ->
-          maybe id (DL.cons . Comment) mcomm $
-            DL.cons
-              (Scalar Nothing untagged Plain f)
-              (go v)
+          DL.cons
+            (Scalar Nothing untagged Plain f)
+            (go v)
+            <> foldMap (DL.singleton . Comment) mcomm
       )
       (sortBy (opts.keyOrdering `on` fst) $ Map.toList obj)
     <> DL.singleton MappingEnd
