@@ -1,3 +1,4 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE ApplicativeDo #-}
 {-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE DataKinds #-}
@@ -24,6 +25,8 @@ module Data.YAML.Pretty (
   OptLabel (..),
   Options (..),
   GenericCodecDefault (..),
+  genericKeyOrdering,
+  withKeyOrdering,
   defaultOptions,
   optLabel,
   genericCodecWith,
@@ -116,6 +119,7 @@ import Data.Kind (Constraint, Type)
 import Data.List (sortBy)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Ord (comparing)
 import Data.Pointed (Pointed (..))
 import Data.Proxy (Proxy (..))
 import Data.Scientific (FPFormat (..), Scientific, formatScientific, fromFloatDigits, toRealFloat)
@@ -138,7 +142,7 @@ import GHC.Generics
 import GHC.Generics qualified as G
 import GHC.OverloadedLabels
 import GHC.Records qualified as GHC
-import GHC.TypeLits (KnownSymbol, symbolVal)
+import GHC.TypeLits (KnownSymbol, symbolVal, symbolVal')
 import Numeric.Natural (Natural)
 import Prelude hiding (elem, null)
 import Prelude qualified hiding (elem)
@@ -911,11 +915,19 @@ data Flavour = Simple | WithDefault
 data Options = Options
   { fieldLabelModifier :: String -> String
   , constructorTagModifier :: String -> String
+  , keyOrdering :: T.Text -> T.Text -> Ordering
+  , objectStyle :: NodeStyle
   }
   deriving (Generic)
 
 defaultOptions :: Options
-defaultOptions = Options {fieldLabelModifier = id, constructorTagModifier = id}
+defaultOptions =
+  Options
+    { fieldLabelModifier = id
+    , constructorTagModifier = id
+    , keyOrdering = compare
+    , objectStyle = Block
+    }
 
 type GHasValueCodec :: Flavour -> (Type -> Type) -> Constraint
 class GHasValueCodec flav f where
@@ -1075,7 +1087,13 @@ instance
   where
   gvalueCodecWith p opts = case sProdType @(ProductType (l :*: r)) of
     SIsProd -> prod $ gprodCodecWith p opts
-    SIsObj -> objectWith defaultObjectFormatter $ gobjCodecWith p opts
+    SIsObj ->
+      objectWith
+        defaultObjectFormatter
+          { style = opts.objectStyle
+          , keyOrdering = opts.keyOrdering
+          }
+        $ gobjCodecWith p opts
 
 instance {-# OVERLAPPING #-} (Constructor i) => GHasValueCodec mode (C1 i U1) where
   gvalueCodecWith _ opts =
@@ -1107,6 +1125,37 @@ instance
   HasValueCodec (GenericCodecDefault x)
   where
   valueCodec = dimap (\(GenericCodecDefault a) -> G.from a) (GenericCodecDefault . G.to) $ gvalueCodecWith (proxy# @'WithDefault) defaultOptions
+
+class GHasKeyOrdering f where
+  gkeyorder' :: Proxy# f -> DList T.Text
+
+instance
+  {-# OVERLAPPING #-}
+  (KnownSymbol s, m ~ 'Just s) =>
+  GHasKeyOrdering (S1 (MetaSel m x y z) f)
+  where
+  gkeyorder' _ = DL.singleton $ T.pack $ symbolVal' @s proxy#
+
+instance GHasKeyOrdering U1 where
+  gkeyorder' _ = mempty
+
+instance {-# OVERLAPPABLE #-} (GHasKeyOrdering f) => GHasKeyOrdering (M1 i f) where
+  gkeyorder' _ = gkeyorder' @f proxy#
+
+instance (GHasKeyOrdering f, GHasKeyOrdering g) => GHasKeyOrdering (f :*: g) where
+  gkeyorder' _ = gkeyorder' (proxy# @f) <> gkeyorder' (proxy# @g)
+
+type GenericKeyOrdering a = GHasKeyOrdering (Rep a)
+
+genericKeyOrdering :: forall a. (GenericKeyOrdering a) => T.Text -> T.Text -> Ordering
+genericKeyOrdering =
+  let dic = Map.fromList $ zip (DL.toList $ gkeyorder' @(Rep a) proxy#) [0 ..]
+      len = Map.size dic
+   in comparing $ \k ->
+        maybe (len, k) (,k) $ Map.lookup k dic
+
+withKeyOrdering :: forall a. (GenericKeyOrdering a) => Options -> Options
+withKeyOrdering = #keyOrdering .~ genericKeyOrdering @a
 
 genericCodecDefaultWith ::
   (GHasValueCodec 'WithDefault (Rep a), Generic a) =>
