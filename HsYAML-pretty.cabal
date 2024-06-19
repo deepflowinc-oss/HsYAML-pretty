@@ -4,6 +4,8 @@ version: 0.1.0.0
 description: Please see the README on GitHub at <https://github.com/deepflowinc/HsYAML-pretty#readme>
 homepage: https://github.com/deepflowinc/HsYAML-pretty#readme
 bug-reports: https://github.com/deepflowinc/HsYAML-pretty/issues
+category: Text
+synopsis: Fine-grained pretty-printer and decoder for HsYAML, ala autodocodec.
 author: DeepFlow, Inc.
 maintainer: DeepFlow, Inc.
 copyright: 2024 (c) DeepFlow, Inc.
@@ -16,7 +18,7 @@ tested-with:
   ghc ==9.6.4
   ghc ==9.8.1
 
-extra-source-files:
+extra-doc-files:
   CHANGELOG.md
   README.md
 
