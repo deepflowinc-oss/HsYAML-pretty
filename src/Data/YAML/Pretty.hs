@@ -45,6 +45,7 @@ module Data.YAML.Pretty (
   fromNodeWith,
   fmapEither,
   fmapMaybe,
+  selectCodec,
   decode1,
   decode1With,
   decode1Strict,
@@ -97,11 +98,13 @@ module Data.YAML.Pretty (
   FieldSpec (..),
   reqFieldSpec,
   optFieldSpec,
+  Selective (..),
 ) where
 
 import Control.Applicative
 import Control.Lens hiding (Context)
 import Control.Monad ((<=<))
+import Control.Selective
 import Data.Aeson (FromJSON, ToJSON)
 import Data.Aeson qualified as J
 import Data.Aeson.Key qualified as AK
@@ -142,7 +145,6 @@ import Data.YAML.Event
 import GHC.Exts (Proxy#, proxy#)
 import GHC.Generics
 import GHC.Generics qualified as G
-import GHC.OverloadedLabels
 import GHC.Records qualified as GHC
 import GHC.TypeLits (KnownSymbol, symbolVal, symbolVal')
 import Numeric.Natural (Natural)
@@ -374,15 +376,22 @@ data Codec context input output where
     ((context == Product) ~ 'False) =>
     (input -> (a, b)) ->
     Codec context a output ->
-    Codec context b output ->
-    Codec context input output
+    Codec context b output' ->
+    Codec context input (output, output')
+  SelectCodec ::
+    Codec Object input (Either a b) ->
+    Codec Object input (a -> b) ->
+    Codec Object input b
+  JoinCodec ::
+    Codec Object input (Codec Object input output) ->
+    Codec Object input output
 
 divideCodec ::
   ((context == Product) ~ 'False) =>
   (input -> (a, b)) ->
   Codec context a output ->
-  Codec context b output ->
-  Codec context input output
+  Codec context b output' ->
+  Codec context input (output, output')
 divideCodec = DivideCodec
 
 instance Pointed (Codec context i) where
@@ -399,6 +408,9 @@ instance
   where
   pure = PureCodec
   (<*>) = ApCodec
+
+instance (context ~ Object) => Monad (Codec context input) where
+  mx >>= f = JoinCodec $ f <$> mx
 
 instance (context ~ Object, v ~ Void) => Alternative (Codec context v) where
   empty = Fail "empty"
@@ -577,33 +589,50 @@ encodeWith_ (ApCodec f x) p =
   encodeWith_ f p <> encodeWith_ x p
 
 encodeFieldMap :: Codec 'Object a x -> a -> Map T.Text DEvStream
-encodeFieldMap = go mempty
+encodeFieldMap = fmap snd . go mempty
   where
-    go :: Map T.Text DEvStream -> Codec 'Object v x -> v -> Map T.Text DEvStream
-    go !acc PureCodec {} _ = acc
+    go :: Map T.Text DEvStream -> Codec 'Object v x -> v -> (x, Map T.Text DEvStream)
+    go !acc (PureCodec x) _ = (x, acc)
+    go !acc (JoinCodec x) a =
+      let (x', acc') = go acc x a
+       in go acc' x' a
     go !acc (ApCodec l r) a =
-      go (go acc l a) r a
+      let (f, acc') = go acc l a
+          (x, acc'') = go acc' r a
+       in (f x, acc'')
     go !acc (RequiredFieldCodec f mcomm _ v) p =
-      Map.insert
-        f
-        ( maybe id (DL.cons . Comment) mcomm $
-            encodeWith_ v p
-        )
-        acc
+      ( p
+      , Map.insert
+          f
+          ( maybe id (DL.cons . Comment) mcomm $
+              encodeWith_ v p
+          )
+          acc
+      )
     go !acc (OptionalFieldCodec f mcomm putNull v) p =
       let withComm = maybe id (DL.cons . Comment) mcomm
-       in case p of
+          acc' = case p of
             Nothing
               | putNull -> Map.insert f (withComm $ DL.singleton nullEvt) acc
               | otherwise -> acc
             Just x -> Map.insert f (withComm $ encodeWith_ v x) acc
-    go !acc (AltCodec l _) (Left x) = go acc l x
-    go !acc (AltCodec _ r) (Right x) = go acc r x
-    go !acc (DiMapCodec l _ a) x = go acc a $ l x
+       in (p, acc')
+    go !acc (AltCodec l _) (Left x) = Bi.first Left $ go acc l x
+    go !acc (AltCodec _ r) (Right x) = Bi.first Right $ go acc r x
+    go !acc (SelectCodec alts decons) x =
+      let (alt, acc') = go acc alts x
+          (dec, acc'') = go acc' decons x
+       in (either dec id alt, acc'')
+    go !acc (DiMapCodec l r a) x =
+      Bi.first (either (error . ("dimap in encodeFieldMap" <>)) id . r) $
+        go acc a $
+          l x
     go !_ (Fail _) x = absurd x
     go !acc (DivideCodec f cl cr) x =
       let (l, r) = f x
-       in go (go acc cl l) cr r
+          (l', acc') = go acc cl l
+          (r', acc'') = go acc' cr r
+       in ((l', r'), acc'')
 
 encodeObjLike :: ObjectFormatter -> (a -> DEvStream) -> Map T.Text a -> DEvStream
 encodeObjLike opts go obj =
@@ -677,8 +706,8 @@ valueFromNode_ (ProductCodec _ x) v =
     =<< expect "array" #_Sequence v
 valueFromNode_ (DiMapCodec _ o p) v =
   Bi.first (posOf v,) . o =<< valueFromNode_ p v
-valueFromNode_ (DivideCodec _ _ cr) v =
-  valueFromNode_ cr v
+valueFromNode_ (DivideCodec _ cl cr) v =
+  (,) <$> valueFromNode_ cl v <*> valueFromNode_ cr v
 
 productFromNode_ ::
   (Show loc) =>
@@ -784,8 +813,17 @@ objectFromNode_ pos (ApCodec f x) dic =
   objectFromNode_ pos f dic <*> objectFromNode_ pos x dic
 objectFromNode_ pos (DiMapCodec _ o p) dic =
   Bi.first (pos,) . o =<< objectFromNode_ pos p dic
-objectFromNode_ pos (DivideCodec _ _ cr) dic =
-  objectFromNode_ pos cr dic
+objectFromNode_ pos (SelectCodec alts fcons) dic = do
+  alt <- objectFromNode_ pos alts dic
+  dec <- objectFromNode_ pos fcons dic
+  pure $ either dec id alt
+objectFromNode_ pos (JoinCodec alts) dic = do
+  alt <- objectFromNode_ pos alts dic
+  objectFromNode_ pos alt dic
+objectFromNode_ pos (DivideCodec _ cl cr) dic =
+  (,)
+    <$> objectFromNode_ pos cl dic
+    <*> objectFromNode_ pos cr dic
 
 class HasValueCodec a where
   valueCodec :: Codec Value a a
@@ -1161,3 +1199,9 @@ genericCodecDefaultWith ::
   Codec 'Value a a
 genericCodecDefaultWith =
   dimap G.from G.to . gvalueCodecWith (proxy# @'WithDefault)
+
+selectCodec :: Codec 'Object input (Either a b) -> Codec 'Object input (a -> b) -> Codec 'Object input b
+selectCodec = SelectCodec
+
+instance (ctx ~ Object) => Selective (Codec ctx input) where
+  select = selectCodec

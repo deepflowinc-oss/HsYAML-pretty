@@ -64,6 +64,7 @@ library
     pointed,
     profunctors,
     scientific,
+    selective,
     text,
     unordered-containers,
     vector,
