@@ -22,8 +22,12 @@ module Data.YAML.Pretty (
   ReqLabel (..),
   reqLabel,
   OptLabel (..),
+  Options (..),
+  GenericCodecDefault (..),
+  defaultOptions,
   optLabel,
-  genericCodec,
+  genericCodecWith,
+  genericCodecDefaultWith,
   parserOnly,
   orParse,
   asumParsers,
@@ -88,8 +92,6 @@ module Data.YAML.Pretty (
   FieldSpec (..),
   reqFieldSpec,
   optFieldSpec,
-  GenericCodecWithDefault (..),
-  genericCodecWithDefault,
 ) where
 
 import Control.Applicative
@@ -104,7 +106,6 @@ import Data.Bitraversable qualified as Bi
 import Data.Bits (Bits, toIntegralSized)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as LBS
-import Data.Coerce (coerce)
 import Data.DList (DList)
 import Data.DList qualified as DL
 import Data.Foldable (foldl')
@@ -907,16 +908,25 @@ maybeCodec codec = dimap (maybe (Right ()) Left) (either Just (const Nothing)) $
 
 data Flavour = Simple | WithDefault
 
+data Options = Options
+  { fieldLabelModifier :: String -> String
+  , constructorTagModifier :: String -> String
+  }
+  deriving (Generic)
+
+defaultOptions :: Options
+defaultOptions = Options {fieldLabelModifier = id, constructorTagModifier = id}
+
 type GHasValueCodec :: Flavour -> (Type -> Type) -> Constraint
 class GHasValueCodec flav f where
-  gvalueCodec :: Proxy# flav -> Codec Value (f ()) (f ())
+  gvalueCodecWith :: Proxy# flav -> Options -> Codec Value (f ()) (f ())
 
 type GHasProductCodec :: Flavour -> (Type -> Type) -> Constraint
 class GHasProductCodec flav f where
-  gprodCodec :: Proxy# flav -> Codec Product (f ()) (f ())
+  gprodCodecWith :: Proxy# flav -> Options -> Codec Product (f ()) (f ())
 
 instance GHasProductCodec flav U1 where
-  gprodCodec _ = pure U1
+  gprodCodecWith _ _ = pure U1
 
 instance
   ( m ~ 'Nothing
@@ -924,16 +934,16 @@ instance
   ) =>
   GHasProductCodec flav (S1 ('MetaSel m x y z) f)
   where
-  gprodCodec _ = elem $ dimap unM1 M1 $ gvalueCodec (proxy# @flav)
+  gprodCodecWith _ opt = elem $ dimap unM1 M1 $ gvalueCodecWith (proxy# @flav) opt
 
 instance
   (GHasProductCodec flav l, GHasProductCodec flav r) =>
   GHasProductCodec flav (l :*: r)
   where
-  gprodCodec p =
+  gprodCodecWith p opt =
     (:*:)
-      <$> lmap (\(l :*: _) -> l) (gprodCodec p)
-      <*> lmap (\(_ :*: r) -> r) (gprodCodec p)
+      <$> lmap (\(l :*: _) -> l) (gprodCodecWith p opt)
+      <*> lmap (\(_ :*: r) -> r) (gprodCodecWith p opt)
 
 data FieldSpec a = FieldSpec
   { description :: Maybe T.Text
@@ -963,16 +973,16 @@ class HasFieldSpec a where
 
 type GHasObjectCodec :: Flavour -> (Type -> Type) -> Constraint
 class GHasObjectCodec flav f where
-  gobjCodec :: Proxy# flav -> Codec Object (f ()) (f ())
+  gobjCodecWith :: Proxy# flav -> Options -> Codec Object (f ()) (f ())
 
 instance
   (GHasObjectCodec f l, GHasObjectCodec f r) =>
   GHasObjectCodec f (l :*: r)
   where
-  gobjCodec p =
+  gobjCodecWith p opts =
     (:*:)
-      <$> lmap (\(l :*: _) -> l) (gobjCodec p)
-      <*> lmap (\(_ :*: r) -> r) (gobjCodec p)
+      <$> lmap (\(l :*: _) -> l) (gobjCodecWith p opts)
+      <*> lmap (\(_ :*: r) -> r) (gobjCodecWith p opts)
 
 instance
   {-# OVERLAPPING #-}
@@ -982,9 +992,9 @@ instance
   ) =>
   GHasObjectCodec 'Simple (S1 ('MetaSel m x y z) (K1 i (Maybe a)))
   where
-  gobjCodec _ =
+  gobjCodecWith _ opt =
     dimap (unK1 . unM1) (M1 . K1) $
-      optionalField' (T.pack $ symbolVal @sel Proxy) Nothing True (valueCodec)
+      optionalField' (T.pack $ opt.fieldLabelModifier $ symbolVal @sel Proxy) Nothing True valueCodec
 
 instance
   {-# OVERLAPPABLE #-}
@@ -994,9 +1004,9 @@ instance
   ) =>
   GHasObjectCodec 'Simple (S1 ('MetaSel m x y z) (K1 i a))
   where
-  gobjCodec _ =
+  gobjCodecWith _ opts =
     dimap (unK1 . unM1) (M1 . K1) $
-      requiredField' (T.pack $ symbolVal @sel Proxy) Nothing Nothing (valueCodec @a)
+      requiredField' (T.pack $ opts.fieldLabelModifier $ symbolVal @sel Proxy) Nothing Nothing (valueCodec @a)
 
 instance
   {-# OVERLAPPING #-}
@@ -1007,10 +1017,10 @@ instance
   ) =>
   GHasObjectCodec WithDefault (S1 ('MetaSel m x y z) (K1 i (Maybe a)))
   where
-  gobjCodec _ =
+  gobjCodecWith _ opts =
     let FieldSpec {..} = fieldSpec @a
      in dimap (unK1 . unM1) (M1 . K1) $
-          optionalField' (T.pack $ symbolVal @sel Proxy) description showNull (valueCodec @a)
+          optionalField' (T.pack $ opts.fieldLabelModifier $ symbolVal @sel Proxy) description showNull (valueCodec @a)
 
 instance
   {-# OVERLAPPING #-}
@@ -1021,13 +1031,13 @@ instance
   ) =>
   GHasObjectCodec WithDefault (S1 ('MetaSel m x y z) (K1 i a))
   where
-  gobjCodec _ =
+  gobjCodecWith _ opts =
     let FieldSpec {..} = fieldSpec @a
      in dimap (unK1 . unM1) (M1 . K1) $
-          requiredField' (T.pack $ symbolVal @sel Proxy) description defaultValue (valueCodec @a)
+          requiredField' (T.pack $ opts.fieldLabelModifier $ symbolVal @sel Proxy) description defaultValue (valueCodec @a)
 
 instance (HasValueCodec c) => GHasValueCodec flav (K1 i c) where
-  gvalueCodec _ = dimap unK1 K1 valueCodec
+  gvalueCodecWith _ _ = dimap unK1 K1 valueCodec
 
 data ProdType = IsProd | IsObj
 
@@ -1055,7 +1065,7 @@ type family GHasGoodContext mode pt where
   GHasGoodContext mode IsObj = GHasObjectCodec mode
 
 instance {-# OVERLAPPABLE #-} (GHasValueCodec mode f) => GHasValueCodec mode (M1 i c f) where
-  gvalueCodec p = dimap unM1 M1 $ gvalueCodec p
+  gvalueCodecWith p = dimap unM1 M1 . gvalueCodecWith p
 
 instance
   ( GHasGoodContext mode (ProductType (l :*: r)) (l :*: r)
@@ -1063,39 +1073,44 @@ instance
   ) =>
   GHasValueCodec mode (l :*: r)
   where
-  gvalueCodec p = case sProdType @(ProductType (l :*: r)) of
-    SIsProd -> prod $ gprodCodec p
-    SIsObj -> objectWith defaultObjectFormatter $ gobjCodec p
+  gvalueCodecWith p opts = case sProdType @(ProductType (l :*: r)) of
+    SIsProd -> prod $ gprodCodecWith p opts
+    SIsObj -> objectWith defaultObjectFormatter $ gobjCodecWith p opts
 
 instance {-# OVERLAPPING #-} (Constructor i) => GHasValueCodec mode (C1 i U1) where
-  gvalueCodec _ =
+  gvalueCodecWith _ opts =
     dimap (\(M1 U1) -> ()) (\() -> M1 U1) $
       literalText $
         T.pack $
-          conName (undefined :: C1 i U1 ())
+          opts.constructorTagModifier $
+            conName (undefined :: C1 i U1 ())
 
 instance (GHasValueCodec mode l, GHasValueCodec mode r) => GHasValueCodec mode (l :+: r) where
-  gvalueCodec p =
+  gvalueCodecWith p opts =
     lmap (\case L1 x -> Left x; R1 y -> Right y) $
-      L1 <$> gvalueCodec p <!> R1 <$> gvalueCodec p
+      L1 <$> gvalueCodecWith p opts <!> R1 <$> gvalueCodecWith p opts
 
 instance
   (GHasValueCodec 'Simple (Rep x), Generic x) =>
   HasValueCodec (Generically x)
   where
-  valueCodec = dimap (\(Generically a) -> G.from a) (Generically . G.to) $ gvalueCodec (proxy# @'Simple)
+  valueCodec = dimap (\(Generically a) -> G.from a) (Generically . G.to) $ gvalueCodecWith (proxy# @'Simple) defaultOptions
 
-genericCodec :: (GHasValueCodec 'Simple (Rep a), Generic a) => Codec 'Value a a
-genericCodec = dimap Generically coerce valueCodec
+genericCodecWith :: (GHasValueCodec 'Simple (Rep a), Generic a) => Options -> Codec 'Value a a
+genericCodecWith = dimap G.from G.to . gvalueCodecWith (proxy# @'Simple)
 
-newtype GenericCodecWithDefault a = GenericCodecWithDefault a
+newtype GenericCodecDefault a = GenericCodecDefault a
   deriving (Show, Eq, Ord)
 
 instance
   (GHasValueCodec 'WithDefault (Rep x), Generic x) =>
-  HasValueCodec (GenericCodecWithDefault x)
+  HasValueCodec (GenericCodecDefault x)
   where
-  valueCodec = dimap (\(GenericCodecWithDefault a) -> G.from a) (GenericCodecWithDefault . G.to) $ gvalueCodec (proxy# @'WithDefault)
+  valueCodec = dimap (\(GenericCodecDefault a) -> G.from a) (GenericCodecDefault . G.to) $ gvalueCodecWith (proxy# @'WithDefault) defaultOptions
 
-genericCodecWithDefault :: (GHasValueCodec 'WithDefault (Rep a), Generic a) => Codec 'Value a a
-genericCodecWithDefault = dimap GenericCodecWithDefault coerce valueCodec
+genericCodecDefaultWith ::
+  (GHasValueCodec 'WithDefault (Rep a), Generic a) =>
+  Options ->
+  Codec 'Value a a
+genericCodecDefaultWith =
+  dimap G.from G.to . gvalueCodecWith (proxy# @'WithDefault)
