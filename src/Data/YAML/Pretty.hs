@@ -63,6 +63,7 @@ module Data.YAML.Pretty (
   bool,
   text,
   textWith,
+  parseText,
   literalText,
   literalTextWith,
   FloatFormatter (..),
@@ -224,6 +225,9 @@ textWith = TextCodec
 text :: Codec 'Value T.Text T.Text
 text = textWith defaultTextFormatter
 
+parseText :: T.Text -> (T.Text -> Either String output) -> Codec 'Value Void output
+parseText = ParseText
+
 literalTextWith :: TextFormatter -> T.Text -> Codec 'Value () ()
 literalTextWith = FixedTextCodec
 
@@ -320,6 +324,7 @@ type Codec :: Context -> Type -> Type -> Type
 data Codec context input output where
   PureCodec :: output -> Codec context input output
   ViaJSON :: !ValueFormatters -> Codec Value J.Value J.Value
+  ParseText :: T.Text -> (T.Text -> Either String output) -> Codec Value Void output
   NullCodec :: Codec Value () ()
   BoolCodec :: Codec Value Bool Bool
   FloatCodec :: !FloatFormatter -> Codec Value Scientific Scientific
@@ -549,6 +554,7 @@ encodeWith_ (FixedTextCodec sty t) () = DL.singleton $ textEvt sty t
 encodeWith_ (Fail _) x = absurd x
 encodeWith_ (AltCodec el _) (Left l) = encodeWith_ el l
 encodeWith_ (AltCodec _ er) (Right r) = encodeWith_ er r
+encodeWith_ ParseText {} b = absurd b
 encodeWith_ (ViaJSON !opts) a = go a
   where
     go = \case
@@ -680,6 +686,8 @@ valueFromNode_ (AltCodec el er) v =
     Right x -> Right (Left x)
     Left {} -> valueFromNode_ (Right <$> er) v
 valueFromNode_ (ViaJSON _) v = nodeToJSON v
+valueFromNode_ (ParseText placeholder p) v =
+  Bi.first (posOf v,) . p =<< expectScalar (T.unpack placeholder) #_SStr v
 valueFromNode_ NullCodec v
   | Y.Scalar _ Y.SNull <- v = pure ()
   | otherwise = Left (posOf v, "Expected null, but got: " <> show v)
