@@ -657,7 +657,7 @@ encodeObjLike opts go obj =
           DL.cons
             (Scalar Nothing untagged Plain f)
             (go v)
-            <> foldMap (DL.singleton . Comment) mcomm
+            <> foldMap (DL.singleton . Comment . (" " <>)) mcomm
       )
       (sortBy (opts.keyOrdering `on` fst) $ Map.toList obj)
     <> DL.singleton MappingEnd
