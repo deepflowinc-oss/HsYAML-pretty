@@ -1139,7 +1139,7 @@ instance
 instance GHasKeyOrdering U1 where
   gkeyorder' _ = mempty
 
-instance {-# OVERLAPPABLE #-} (GHasKeyOrdering f) => GHasKeyOrdering (M1 i f) where
+instance {-# OVERLAPPABLE #-} (GHasKeyOrdering f) => GHasKeyOrdering (M1 i c f) where
   gkeyorder' _ = gkeyorder' @f proxy#
 
 instance (GHasKeyOrdering f, GHasKeyOrdering g) => GHasKeyOrdering (f :*: g) where
