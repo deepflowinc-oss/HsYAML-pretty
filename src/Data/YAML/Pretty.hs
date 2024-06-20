@@ -69,6 +69,7 @@ module Data.YAML.Pretty (
   textWith,
   TextFormatter,
   ScalarStyle (..),
+  NodeStyle (..),
   parseText,
   literalText,
   literalTextWith,
