@@ -61,11 +61,13 @@ library
     dlist,
     generic-lens,
     lens,
+    mtl,
     pointed,
     profunctors,
     scientific,
     selective,
     text,
+    transformers,
     unordered-containers,
     vector,
 

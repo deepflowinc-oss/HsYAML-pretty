@@ -8,6 +8,7 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MagicHash #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedLabels #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -108,11 +109,17 @@ module Data.YAML.Pretty (
   reqFieldSpec,
   optFieldSpec,
   Selective (..),
+  pretty,
 ) where
 
 import Control.Applicative
-import Control.Lens hiding (Context)
-import Control.Monad ((<=<))
+import Control.Arrow ((>>>))
+import Control.Lens hiding (Context, index)
+import Control.Monad (forM_, when, (<=<))
+import Control.Monad.State.Class (MonadState, gets, modify)
+import Control.Monad.Trans.RWS.Strict (RWS, RWST (..), execRWS)
+import Control.Monad.Trans.Writer.CPS qualified as W
+import Control.Monad.Writer.Class (tell)
 import Control.Selective
 import Data.Aeson (FromJSON, ToJSON)
 import Data.Aeson qualified as J
@@ -123,22 +130,28 @@ import Data.Bitraversable qualified as Bi
 import Data.Bits (Bits, toIntegralSized)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as LBS
+import Data.Char qualified as C
 import Data.DList (DList)
 import Data.DList qualified as DL
-import Data.Foldable (foldl')
+import Data.Foldable (foldl', foldlM)
 import Data.Function (on)
+import Data.Functor (void)
 import Data.Generics.Labels ()
 import Data.Int
 import Data.Kind (Constraint, Type)
 import Data.List (sortBy)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (isJust)
+import Data.Monoid (Any (..))
 import Data.Ord (comparing)
 import Data.Pointed (Pointed (..))
 import Data.Proxy (Proxy (..))
-import Data.Scientific (FPFormat (..), Scientific, formatScientific, fromFloatDigits, toRealFloat)
+import Data.Scientific (FPFormat (..), Scientific, floatingOrInteger, formatScientific, fromFloatDigits, toRealFloat)
+import Data.String (fromString)
 import Data.Text qualified as T
 import Data.Text.Lazy qualified as LT
+import Data.Text.Lazy.Builder qualified as TB
 import Data.Tuple
 import Data.Type.Bool
 import Data.Type.Equality
@@ -156,6 +169,7 @@ import GHC.Generics
 import GHC.Generics qualified as G
 import GHC.Records qualified as GHC
 import GHC.TypeLits (KnownSymbol, symbolVal, symbolVal')
+import Numeric (showHex)
 import Numeric.Natural (Natural)
 import Prelude hiding (elem, null)
 import Prelude qualified hiding (elem)
@@ -634,19 +648,21 @@ encodeFieldMap = fmap snd . go mempty
        in (f x, acc'')
     go !acc (RequiredFieldCodec f mcomm _ v) p =
       (p, Map.insert f (mcomm, encodeWith_ v p) acc)
-    go !acc (OptionalFieldCodec f mcomm putNull v) p =
+    go !acc (OptionalFieldCodec f mcomm showN v) p =
       let acc' = case p of
             Nothing
-              | putNull -> Map.insert f (mcomm, DL.singleton nullEvt) acc
+              | showN -> Map.insert f (mcomm, DL.singleton nullEvt) acc
               | otherwise -> acc
             Just x -> Map.insert f (mcomm, encodeWith_ v x) acc
        in (p, acc')
     go !acc (AltCodec l _) (Left x) = Bi.first Left $ go acc l x
     go !acc (AltCodec _ r) (Right x) = Bi.first Right $ go acc r x
     go !acc (SelectCodec alts decons) x =
-      let (alt, acc') = go acc alts x
-          (dec, acc'') = go acc' decons x
-       in (either dec id alt, acc'')
+      case go acc alts x of
+        (Right v, acc') -> (v, acc')
+        (Left b, acc') ->
+          let (dec, acc'') = go acc' decons x
+           in (dec b, acc'')
     go !acc (DiMapCodec l r a) x =
       Bi.first (either (error . ("dimap in encodeFieldMap" <>)) id . r) $
         go acc a $
@@ -842,8 +858,11 @@ objectFromNode_ pos (DiMapCodec _ o p) dic =
   Bi.first (pos,) . o =<< objectFromNode_ pos p dic
 objectFromNode_ pos (SelectCodec alts fcons) dic = do
   alt <- objectFromNode_ pos alts dic
-  dec <- objectFromNode_ pos fcons dic
-  pure $ either dec id alt
+  case alt of
+    Right a -> pure a
+    Left b -> do
+      dec <- objectFromNode_ pos fcons dic
+      pure $ dec b
 objectFromNode_ pos (JoinCodec alts) dic = do
   alt <- objectFromNode_ pos alts dic
   objectFromNode_ pos alt dic
@@ -1255,3 +1274,416 @@ instance (ctx ~ Object) => Selective (Codec ctx input) where
 
 abort :: String -> Codec context Void a
 abort = Fail
+
+data CommentInfo = NoComment | HasComment
+  deriving (Show, Eq, Ord, Generic)
+
+data PrinterContext ctx where
+  TopLevel :: PrinterContext 'Value
+  ExpectFieldLabel :: !NodeStyle -> !CommentInfo -> PrinterContext 'Object
+  ExpectFieldValue :: NodeStyle -> PrinterContext 'Value
+  ExpectArrayElem :: {style :: !NodeStyle, index :: !Int} -> PrinterContext 'Value
+
+deriving instance Show (PrinterContext ctx)
+
+data PrintEnv ctx = PrintEnv
+  {level :: !Word, context :: !(PrinterContext ctx)}
+  deriving (Show, Generic)
+
+newtype Printer ctx a = Printer {unPrinter :: RWS () TB.Builder (PrintEnv ctx) a}
+  deriving (Generic)
+  deriving newtype
+    ( Functor
+    , Applicative
+    , Monad
+    , MonadState (PrintEnv ctx)
+    )
+
+pretty :: Codec Value a x -> a -> TB.Builder
+pretty codec x =
+  snd $
+    execRWS (prettyValue codec x).unPrinter () $
+      PrintEnv {level = 0, context = TopLevel}
+
+prettyValue :: Codec Value i x -> i -> Printer Value ()
+prettyValue PureCodec {} _ = pure ()
+prettyValue (ViaJSON fs) val = prettyJSON fs val
+prettyValue Fail {} x = absurd x
+prettyValue (ParseText _ _) x = absurd x
+prettyValue NullCodec () = putNull
+prettyValue BoolCodec p = putBool p
+prettyValue (FloatCodec fmt) p =
+  putFloat fmt p
+prettyValue (IntCodec Base10) p = putInteger p
+prettyValue (TextCodec sty) p = putText sty p
+prettyValue (FixedTextCodec sty x) () = putText sty x
+prettyValue (ArrayCodec sty av) p = putArray sty av p
+prettyValue (ObjectCodec opts v) p = putObject opts v p
+prettyValue (ProductCodec sty v) p = putProduct sty v p
+prettyValue (AltCodec el _) (Left l) = prettyValue el l
+prettyValue (AltCodec _ er) (Right r) = prettyValue er r
+prettyValue (DiMapCodec f _ p) x = prettyValue p $ f x
+prettyValue (DivideCodec f cl cr) x =
+  let (l, r) = f x
+   in prettyValue cl l >> prettyValue cr r
+
+putFloat :: FloatFormatter -> Scientific -> Printer 'Value ()
+putFloat FloatFormatter {..} p =
+  putLit $ fromString $ formatScientific format places p
+
+putBool :: Bool -> Printer 'Value ()
+putBool p = putLit $ if p then "true" else "false"
+
+putNull :: Printer 'Value ()
+putNull = putLit "null"
+
+localState :: PrintEnv ctx -> Printer ctx a -> Printer ctx' a
+localState s' act = Printer $ RWST \r s -> do
+  (a, _, w) <- runRWST act.unPrinter r s'
+  pure (a, s, w)
+
+putProduct ::
+  NodeStyle ->
+  Codec Product i x ->
+  i ->
+  Printer Value ()
+putProduct sty = go
+  where
+    go :: Codec Product i x -> i -> Printer Value ()
+    go PureCodec {} _ = pure ()
+    go Fail {} x = absurd x
+    go (DiMapCodec f _ v) x = go v (f x)
+    go (ApCodec l r) x = go l x *> go r x
+    go (ElementCodec a) x = do
+      lvl <- gets (.level)
+      localState
+        PrintEnv {level = lvl + 2, context = ExpectArrayElem sty 0}
+        $ prettyValue a x
+
+showHexExp2 :: Int -> TB.Builder
+showHexExp2 n =
+  let orig = T.pack $ showHex n ""
+      len = T.length orig
+   in if
+        | len <= 2 ->
+            "\\0x" <> TB.fromText (T.replicate (2 - len) "0") <> TB.fromText orig
+        | len <= 4 ->
+            "\\0u" <> TB.fromText (T.replicate (4 - len) "0") <> TB.fromText orig
+        | otherwise ->
+            "\\0U" <> TB.fromText (T.replicate (8 - len) "0") <> TB.fromText orig
+
+putText :: ScalarStyle -> T.Text -> Printer Value ()
+putText sty = render' <$> selectSuitableStyle sty <*> id
+  where
+    escape '\NUL' = "\\0"
+    escape '\a' = "\\a"
+    escape '\b' = "\\b"
+    escape '\t' = "\\t"
+    escape '\n' = "\\n"
+    escape '\v' = "\\v"
+    escape '\f' = "\\f"
+    escape '\r' = "\\r"
+    escape '"' = "\\\""
+    escape '\\' = "\\\\"
+    escape '\x85' = "\\N"
+    escape '\xA0' = "\\_"
+    escape '\x2028' = "\\L"
+    escape '\x2029' = "\\P"
+    escape c
+      | C.isPrint c = TB.fromText $ T.singleton c
+      | otherwise = showHexExp2 $ C.ord c
+
+    render' Plain t = putLit $ TB.fromText t
+    render' DoubleQuoted t = do
+      putLit $ "\"" <> foldMap escape (T.unpack t) <> "\""
+    render' SingleQuoted t =
+      putLit $ "'" <> TB.fromText (T.replace "'" "''" t) <> "'"
+    render' (Folded ch ind) t = render' (Literal ch ind) t
+    render' (Literal ch ind) t = do
+      i <- gets (.level)
+      let (offInd, off) = toIndOff ind
+          chompInd = renderChomp ch
+          ls = T.splitOn "\n" t
+          indent = fromIntegral i + off
+      putLit $
+        "|"
+          <> offInd
+          <> chompInd
+          <> "\n"
+          <> foldMap
+            ( \l ->
+                fromString (replicate indent ' ') <> TB.fromText l <> "\n"
+            )
+            ls
+
+renderChomp :: Chomp -> TB.Builder
+renderChomp Strip = "-"
+renderChomp Clip = ""
+renderChomp Keep = "+"
+
+toIndOff :: IndentOfs -> (TB.Builder, Int)
+toIndOff = maybe ("", 2) ((,) <$> fromString . show <*> id) . fromInd
+
+fromInd :: IndentOfs -> Maybe Int
+fromInd IndentAuto = Nothing
+fromInd IndentOfs1 = Just 1
+fromInd IndentOfs2 = Just 2
+fromInd IndentOfs3 = Just 3
+fromInd IndentOfs4 = Just 4
+fromInd IndentOfs5 = Just 5
+fromInd IndentOfs6 = Just 6
+fromInd IndentOfs7 = Just 7
+fromInd IndentOfs8 = Just 8
+fromInd IndentOfs9 = Just 9
+
+breakChar :: Char -> Bool
+breakChar c = c == '\r' || c == '\n'
+
+nonBreakChar :: Char -> Bool
+nonBreakChar c =
+  C.isPrint c && not (breakChar c) && c /= '\xFEFF'
+
+whiteChar :: Char -> Bool
+whiteChar c = c == '\t' || c == ' '
+
+nonspaceChar :: Char -> Bool
+nonspaceChar c = nonBreakChar c && not (whiteChar c)
+
+validPlainStart :: T.Text -> Bool
+validPlainStart t =
+  case T.uncons t of
+    Nothing -> False
+    Just (c, rest) ->
+      nonspaceChar c
+        || (c == '?' || c == ':' || c == '-')
+          && maybe False (isPlainSafe . fst) (T.uncons rest)
+
+isPlainSafe :: Char -> Bool
+isPlainSafe c = nonspaceChar c && c /= ',' && c /= '[' && c /= ']' && c /= '{' && c /= '}'
+
+validPlainText :: T.Text -> Bool
+validPlainText txt
+  | validPlainStart txt = go Nothing txt
+  where
+    go :: Maybe Char -> T.Text -> Bool
+    go _ "" = True
+    go (Just cls) x =
+      case T.uncons x of
+        Nothing
+          | ':' <- cls -> False
+          | otherwise -> True
+        Just (c, rest) ->
+          case c of
+            ':' -> go (Just c) rest
+            '#'
+              | nonspaceChar c -> go (Just c) rest
+              | otherwise -> False
+            _
+              | nonspaceChar c -> go (Just c) rest
+              | otherwise -> False
+    go Nothing t =
+      case T.uncons t of
+        Nothing -> False
+        Just (c, rest) -> go (Just c) rest
+validPlainText _ = False
+
+selectSuitableStyle :: ScalarStyle -> T.Text -> ScalarStyle
+selectSuitableStyle DoubleQuoted _ = DoubleQuoted
+selectSuitableStyle Plain t
+  | validPlainText t = Plain
+  | otherwise = DoubleQuoted
+selectSuitableStyle SingleQuoted t =
+  let nonPrint = T.any (not . C.isPrint) t
+      emptyLine = "\n\n" `T.isInfixOf` t
+      leadingTrailingSpaces =
+        any
+          ( on (||) (not . T.null)
+              <$> T.takeWhile C.isSpace
+              <*> T.takeWhileEnd C.isSpace
+          )
+          $ T.lines t
+      invalid = nonPrint || emptyLine || leadingTrailingSpaces
+   in if invalid then DoubleQuoted else SingleQuoted
+selectSuitableStyle l@Literal {} t =
+  if T.any (not . nonBreakChar) t
+    then DoubleQuoted
+    else l
+selectSuitableStyle l@Folded {} t =
+  if T.any (not . nonBreakChar) t
+    then DoubleQuoted
+    else l
+
+data ObjectStatus = ObjectStatus
+  { objects :: Map T.Text (Maybe T.Text, Printer 'Value ())
+  , anyComments :: !Any
+  }
+  deriving (Generic)
+  deriving (Semigroup, Monoid) via Generically ObjectStatus
+
+collectObjects :: Codec 'Object i x -> i -> ObjectStatus
+collectObjects = fmap W.execWriter . go
+  where
+    go :: Codec 'Object a x -> a -> W.Writer ObjectStatus x
+    go (PureCodec x) _ = pure x
+    go Fail {} x = absurd x
+    go (AltCodec el _) (Left l) = Left <$> go el l
+    go (AltCodec _ er) (Right r) = Right <$> go er r
+    go (DiMapCodec f g v) x =
+      go v (f x) <&> \a ->
+        case g a of
+          Right y -> y
+          Left err -> error $ "collectObjects: DiMapCodec: " <> err
+    go (RequiredFieldCodec f mcomm _ v) p = do
+      W.tell $
+        ObjectStatus
+          { objects =
+              Map.singleton f (mcomm, prettyValue v p)
+          , anyComments = Any $ isJust mcomm
+          }
+      pure p
+    go (OptionalFieldCodec f mcomm prNull v) p = do
+      when (isJust mcomm || prNull) $
+        W.tell $
+          ObjectStatus
+            { objects =
+                Map.singleton f (mcomm, maybe putNull (prettyValue v) p)
+            , anyComments = Any $ isJust mcomm
+            }
+      pure p
+    go (ApCodec l r) x = go l x <*> go r x
+    go (DivideCodec f lp rp) x = do
+      let (l, r) = f x
+      l' <- go lp l
+      r' <- go rp r
+      pure (l', r')
+    go (SelectCodec eith mp) v = do
+      x <- go eith v
+      case x of
+        Left l -> do
+          f <- go mp v
+          pure $ f l
+        Right r -> pure r
+    go (JoinCodec mf) v = do
+      f <- go mf v
+      go f v
+
+putObject :: ObjectFormatter -> Codec 'Object i x -> i -> Printer 'Value ()
+putObject objf p i = do
+  let ObjectStatus {anyComments = Any hasComment, ..} = collectObjects p i
+      ents = sortBy (objf.keyOrdering `on` fst) $ Map.toList objects
+  lvl' <-
+    gets (.context) >>= \case
+      TopLevel -> gets (.level)
+      ExpectFieldValue _ -> gets (.level)
+      ExpectArrayElem {style = Flow, ..} -> do
+        when (index > 0) $ Printer $ tell ", "
+        gets (.level)
+      ExpectArrayElem {style = Block} -> do
+        putIndent
+        Printer $ tell "- "
+        gets ((+ 2) . (.level))
+  case objf.style of
+    Flow -> do
+      Printer $ tell "{"
+      when hasComment $ Printer $ tell " "
+    Block -> newLine >> putIndent
+  let env' =
+        PrintEnv
+          { level = lvl'
+          , context = ExpectFieldLabel objf.style NoComment
+          }
+  localState env' $ go hasComment ents
+  case objf.style of
+    Flow -> do
+      Printer $ tell "}"
+      newLine
+    Block -> newLine
+  where
+    go hasComment ents = do
+      lvl <- fromIntegral <$> gets (.level)
+      let indent = Printer $ tell $ fromString (replicate lvl ' ')
+          newl = Printer $ tell "\n"
+      void $
+        foldlM
+          ( \ !isTail (lab, (mcomm, printer)) -> do
+              when isTail $ case objf.style of
+                Flow -> do
+                  when hasComment indent
+                  Printer $ tell ", "
+                Block -> indent
+              forM_ mcomm $
+                T.lines >>> mapM_ \l -> do
+                  Printer $ tell $ "# " <> TB.fromText l
+                  newl
+                  indent
+              when (objf.style == Flow && isTail) $ Printer $ tell ", "
+              Printer $ tell $ TB.fromText lab <> ": "
+              let env'' =
+                    PrintEnv
+                      { level = fromIntegral lvl + 2
+                      , context = ExpectFieldValue objf.style
+                      }
+              localState env'' printer
+              if objf.style == Flow && not hasComment
+                then Printer $ tell ", "
+                else newl
+              pure True
+          )
+          False
+          ents
+
+putArray :: BlockFormatter -> Codec 'Value i o -> V.Vector i -> Printer 'Value ()
+putArray fmt p v = do
+  i0 <- gets (.level)
+  let env' =
+        PrintEnv
+          { level = i0
+          , context = ExpectArrayElem {style = fmt.style, index = 0}
+          }
+  case fmt.style of
+    Flow -> do
+      Printer $ tell "["
+      localState env' $ V.mapM_ (prettyValue p) v
+      Printer $ tell "]"
+    Block -> do
+      localState env' $ V.mapM_ (prettyValue p) v
+
+newLine :: Printer 'Value ()
+newLine = Printer $ tell "\n"
+
+putIndent :: Printer ctx ()
+putIndent = Printer . tell . fromString . flip replicate ' ' . fromIntegral =<< gets (.level)
+
+putLit :: TB.Builder -> Printer 'Value ()
+putLit x =
+  gets (.context) >>= \case
+    TopLevel -> Printer $ tell $ x <> "\n"
+    ExpectFieldValue _ -> Printer $ tell x
+    ExpectArrayElem {..} -> do
+      case style of
+        Flow
+          | index > 0 -> Printer $ tell $ ", " <> x
+          | otherwise -> Printer $ tell x
+        Block -> do
+          putIndent
+          Printer $ tell $ "- " <> x <> "\n"
+      modify $ \env -> env {context = ExpectArrayElem {index = index + 1, ..}}
+
+prettyJSON :: ValueFormatters -> J.Value -> Printer 'Value ()
+prettyJSON _ J.Null = putNull
+prettyJSON opts (J.Object dic) = putJSONObject' opts.object dic
+prettyJSON opts (J.Array dic) = putJSONArray' opts.array dic
+prettyJSON opts (J.String txt) = putText opts.text txt
+prettyJSON opts (J.Number n) = case floatingOrInteger @Double n of
+  Left {} -> putFloat opts.float n
+  Right i -> putInteger i
+prettyJSON _ (J.Bool b) = putBool b
+
+putInteger :: Integer -> Printer 'Value ()
+putInteger = putLit . fromString . show
+
+putJSONArray' :: BlockFormatter -> J.Array -> Printer 'Value ()
+putJSONArray' = undefined
+
+putJSONObject' :: ObjectFormatter -> J.Object -> Printer 'Value ()
+putJSONObject' = undefined
