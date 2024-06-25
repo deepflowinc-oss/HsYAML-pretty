@@ -113,13 +113,11 @@ module Data.YAML.Pretty (
 ) where
 
 import Control.Applicative
-import Control.Arrow ((>>>))
 import Control.Lens hiding (Context, index)
 import Control.Monad (forM_, when, (<=<))
-import Control.Monad.State.Class (MonadState, gets, modify)
-import Control.Monad.Trans.RWS.Strict (RWS, RWST (..), execRWS)
+import Control.Monad.State.Class (modify')
+import Control.Monad.State.Strict (State, StateT (..), execState)
 import Control.Monad.Trans.Writer.CPS qualified as W
-import Control.Monad.Writer.Class (tell)
 import Control.Selective
 import Data.Aeson (FromJSON, ToJSON)
 import Data.Aeson qualified as J
@@ -133,9 +131,8 @@ import Data.ByteString.Lazy qualified as LBS
 import Data.Char qualified as C
 import Data.DList (DList)
 import Data.DList qualified as DL
-import Data.Foldable (foldl', foldlM)
+import Data.Foldable (foldl')
 import Data.Function (on)
-import Data.Functor (void)
 import Data.Generics.Labels ()
 import Data.Int
 import Data.Kind (Constraint, Type)
@@ -148,10 +145,10 @@ import Data.Ord (comparing)
 import Data.Pointed (Pointed (..))
 import Data.Proxy (Proxy (..))
 import Data.Scientific (FPFormat (..), Scientific, floatingOrInteger, formatScientific, fromFloatDigits, toRealFloat)
-import Data.String (fromString)
+import Data.String (IsString, fromString)
 import Data.Text qualified as T
 import Data.Text.Lazy qualified as LT
-import Data.Text.Lazy.Builder qualified as TB
+import Data.Text.Lazy qualified as TL
 import Data.Tuple
 import Data.Type.Bool
 import Data.Type.Equality
@@ -171,6 +168,9 @@ import GHC.Records qualified as GHC
 import GHC.TypeLits (KnownSymbol, symbolVal, symbolVal')
 import Numeric (showHex)
 import Numeric.Natural (Natural)
+import Prettyprinter (Doc, LayoutOptions (..), layoutPretty)
+import Prettyprinter qualified as PP
+import Prettyprinter.Render.Text qualified as PP
 import Prelude hiding (elem, null)
 import Prelude qualified hiding (elem)
 
@@ -393,8 +393,8 @@ data Codec context input output where
     Codec context input output ->
     Codec context input output'
   ElementCodec ::
-    Codec Value input output ->
-    Codec Product input output
+    Codec Value i i ->
+    Codec Product i i
   ProductCodec :: NodeStyle -> Codec Product i o -> Codec Value i o
   AltCodec ::
     ((context == Product) ~ 'False) =>
@@ -877,6 +877,9 @@ class HasValueCodec a where
 class HasObjectCodec a where
   objectCodec :: Codec Object a a
 
+instance HasValueCodec Bool where
+  valueCodec = bool
+
 instance HasValueCodec Word where
   valueCodec = integral
 
@@ -989,7 +992,7 @@ instance
         <*> lmap (view _4) (elem valueCodec)
         <*> lmap (view _5) (elem valueCodec)
 
-elem :: Codec 'Value input output -> Codec 'Product input output
+elem :: Codec 'Value input input -> Codec 'Product input input
 elem = ElementCodec
 
 maybeCodec :: Codec Value i o -> Codec Value (Maybe i) (Maybe o)
@@ -1286,32 +1289,38 @@ data PrinterContext ctx where
 
 deriving instance Show (PrinterContext ctx)
 
-data PrintEnv ctx = PrintEnv
-  {level :: !Word, context :: !(PrinterContext ctx)}
+newtype PrintEnv = PrintEnv {doc :: Doc ()}
   deriving (Show, Generic)
 
-newtype Printer ctx a = Printer {unPrinter :: RWS () TB.Builder (PrintEnv ctx) a}
+newtype Printer a = Printer {unPrinter :: State PrintEnv a}
   deriving (Generic)
   deriving newtype
     ( Functor
     , Applicative
     , Monad
-    , MonadState (PrintEnv ctx)
     )
 
-pretty :: Codec Value a x -> a -> TB.Builder
-pretty codec x =
-  snd $
-    execRWS (prettyValue codec x).unPrinter () $
-      PrintEnv {level = 0, context = TopLevel}
+data LineCount = SingleLine | MultiLine
+  deriving (Show, Eq, Ord, Generic)
 
-prettyValue :: Codec Value i x -> i -> Printer Value ()
-prettyValue PureCodec {} _ = pure ()
+instance Semigroup LineCount where
+  _ <> _ = MultiLine
+
+pretty :: Codec Value a x -> a -> TL.Text
+pretty codec x =
+  PP.renderLazy $
+    layoutPretty PP.defaultLayoutOptions {layoutPageWidth = PP.Unbounded} $
+      (.doc) $
+        execState (prettyValue codec x).unPrinter $
+          PrintEnv {doc = mempty}
+
+prettyValue :: Codec Value i x -> i -> Printer LineCount
+prettyValue PureCodec {} _ = pure SingleLine
 prettyValue (ViaJSON fs) val = prettyJSON fs val
 prettyValue Fail {} x = absurd x
 prettyValue (ParseText _ _) x = absurd x
-prettyValue NullCodec () = putNull
-prettyValue BoolCodec p = putBool p
+prettyValue NullCodec () = SingleLine <$ putNull
+prettyValue BoolCodec p = SingleLine <$ putBool p
 prettyValue (FloatCodec fmt) p =
   putFloat fmt p
 prettyValue (IntCodec Base10) p = putInteger p
@@ -1327,52 +1336,127 @@ prettyValue (DivideCodec f cl cr) x =
   let (l, r) = f x
    in prettyValue cl l >> prettyValue cr r
 
-putFloat :: FloatFormatter -> Scientific -> Printer 'Value ()
+putFloat :: FloatFormatter -> Scientific -> Printer LineCount
 putFloat FloatFormatter {..} p =
-  putLit $ fromString $ formatScientific format places p
+  SingleLine <$ do putSpaced $ fromString $ formatScientific format places p
 
-putBool :: Bool -> Printer 'Value ()
-putBool p = putLit $ if p then "true" else "false"
+putBool :: Bool -> Printer ()
+putBool p = putSpaced $ if p then "true" else "false"
 
-putNull :: Printer 'Value ()
-putNull = putLit "null"
+putNull :: Printer ()
+putNull = putSpaced "null"
 
-localState :: PrintEnv ctx -> Printer ctx a -> Printer ctx' a
-localState s' act = Printer $ RWST \r s -> do
-  (a, _, w) <- runRWST act.unPrinter r s'
-  pure (a, s, w)
+mapDoc :: (Doc () -> Doc ()) -> Printer a -> Printer a
+mapDoc wrap act = Printer $ StateT \s -> do
+  (a, s') <- runStateT act.unPrinter s {doc = mempty}
+  pure (a, s {doc = s.doc <> wrap s'.doc})
+
+-- | Captures output of a printer, without changing to the current state
+capture :: Printer a -> Printer (a, Doc ())
+capture act = Printer $ StateT \s -> do
+  (a, s') <- runStateT act.unPrinter s
+  pure ((a, s'.doc), s)
+
+bracketed :: Printer a -> Printer a
+bracketed = mapDoc PP.brackets
+
+braced :: Printer a -> Printer a
+braced = mapDoc PP.braces
+
+putDirect :: PP.Doc () -> Printer ()
+putDirect doc = Printer $ modify' \s -> s {doc = s.doc <> doc}
+
+putSpaced :: PP.Doc () -> Printer ()
+putSpaced doc = Printer $ modify' \s -> s {doc = s.doc PP.<+> doc}
+
+hcommaSepped :: [Printer LineCount] -> Printer LineCount
+hcommaSepped factors = do
+  docs <- mapM capture factors
+  putDirect $ PP.hsep $ PP.punctuate PP.comma $ snd <$> docs
+  pure $ if any ((== MultiLine) . fst) docs then MultiLine else SingleLine
+
+vcommaSepped :: [Printer LineCount] -> Printer LineCount
+vcommaSepped factors = do
+  docs <- mapM capture factors
+  putDirect $ PP.vsep $ PP.punctuate PP.comma $ snd <$> docs
+  pure $
+    if length factors > 1 || any ((== MultiLine) . fst) docs
+      then MultiLine
+      else SingleLine
+
+vsepped :: [Printer LineCount] -> Printer LineCount
+vsepped factors = do
+  docs <- mapM capture factors
+  putDirect $ PP.vsep $ snd <$> docs
+  pure $
+    if any ((== MultiLine) . fst) docs || length factors > 1
+      then MultiLine
+      else SingleLine
+
+aligned :: Printer a -> Printer a
+aligned = mapDoc PP.align
+
+nestedIfMultiline :: Int -> Printer LineCount -> Printer LineCount
+nestedIfMultiline n (Printer act) = Printer $ StateT \s -> do
+  (lc, s') <- runStateT act s {doc = mempty}
+  let doc' = case lc of
+        MultiLine -> s.doc <> PP.line <> PP.nest n s'.doc
+        SingleLine -> s.doc PP.<+> s'.doc
+  pure (lc, s {doc = doc'})
+
+indentedIfMultiline :: Int -> Printer LineCount -> Printer LineCount
+indentedIfMultiline n (Printer act) = Printer $ StateT \s -> do
+  (lc, s') <- runStateT act s {doc = mempty}
+  let doc' = case lc of
+        MultiLine -> s.doc <> PP.line <> PP.indent n s'.doc
+        SingleLine -> s.doc PP.<+> s'.doc
+  pure (lc, s {doc = doc'})
+
+instance (x ~ ()) => IsString (Printer x) where
+  fromString str = Printer $ modify' \s -> s {doc = s.doc <> PP.pretty str}
 
 putProduct ::
   NodeStyle ->
   Codec Product i x ->
   i ->
-  Printer Value ()
-putProduct sty = go
-  where
-    go :: Codec Product i x -> i -> Printer Value ()
-    go PureCodec {} _ = pure ()
-    go Fail {} x = absurd x
-    go (DiMapCodec f _ v) x = go v (f x)
-    go (ApCodec l r) x = go l x *> go r x
-    go (ElementCodec a) x = do
-      lvl <- gets (.level)
-      localState
-        PrintEnv {level = lvl + 2, context = ExpectArrayElem sty 0}
-        $ prettyValue a x
+  Printer LineCount
+putProduct sty c = putArrayLike sty . collectFactor c
 
-showHexExp2 :: Int -> TB.Builder
+putArray :: BlockFormatter -> Codec 'Value i o -> V.Vector i -> Printer LineCount
+putArray fmt p = putArrayLike fmt.style . V.toList . V.map (prettyValue p)
+
+putArrayLike :: NodeStyle -> [Printer LineCount] -> Printer LineCount
+putArrayLike sty vs =
+  case sty of
+    Block
+      | not (Prelude.null vs) ->
+          MultiLine <$ vsepped (map (\v -> do putDirect "- "; aligned v) vs)
+    _ -> bracketed $ hcommaSepped vs
+
+collectFactor :: Codec Product i x -> i -> [Printer LineCount]
+collectFactor = fmap (DL.toList . W.execWriter) . go
+  where
+    go :: Codec Product a x -> a -> W.Writer (DL.DList (Printer LineCount)) x
+    go (PureCodec a) _ = pure a
+    go Fail {} x = absurd x
+    go (DiMapCodec f g v) x =
+      either (error . ("collectFactor: DiMapCodec: " <>)) id . g <$> go v (f x)
+    go (ApCodec l r) x = go l x <*> go r x
+    go (ElementCodec a) x = x <$ W.tell (DL.singleton $ prettyValue a x)
+
+showHexExp2 :: Int -> PP.Doc ()
 showHexExp2 n =
   let orig = T.pack $ showHex n ""
       len = T.length orig
    in if
         | len <= 2 ->
-            "\\0x" <> TB.fromText (T.replicate (2 - len) "0") <> TB.fromText orig
+            "\\0x" <> PP.pretty (T.replicate (2 - len) "0") <> PP.pretty orig
         | len <= 4 ->
-            "\\0u" <> TB.fromText (T.replicate (4 - len) "0") <> TB.fromText orig
+            "\\0u" <> PP.pretty (T.replicate (4 - len) "0") <> PP.pretty orig
         | otherwise ->
-            "\\0U" <> TB.fromText (T.replicate (8 - len) "0") <> TB.fromText orig
+            "\\0U" <> PP.pretty (T.replicate (8 - len) "0") <> PP.pretty orig
 
-putText :: ScalarStyle -> T.Text -> Printer Value ()
+putText :: ScalarStyle -> T.Text -> Printer LineCount
 putText sty = render' <$> selectSuitableStyle sty <*> id
   where
     escape '\NUL' = "\\0"
@@ -1390,38 +1474,33 @@ putText sty = render' <$> selectSuitableStyle sty <*> id
     escape '\x2028' = "\\L"
     escape '\x2029' = "\\P"
     escape c
-      | C.isPrint c = TB.fromText $ T.singleton c
+      | C.isPrint c = PP.pretty $ T.singleton c
       | otherwise = showHexExp2 $ C.ord c
 
-    render' Plain t = putLit $ TB.fromText t
-    render' DoubleQuoted t = do
-      putLit $ "\"" <> foldMap escape (T.unpack t) <> "\""
+    render' Plain t = SingleLine <$ putSpaced (PP.pretty t)
+    render' DoubleQuoted t =
+      SingleLine <$ do
+        putSpaced $ "\"" <> foldMap escape (T.unpack t) <> "\""
     render' SingleQuoted t =
-      putLit $ "'" <> TB.fromText (T.replace "'" "''" t) <> "'"
+      SingleLine <$ do
+        putSpaced $ "'" <> PP.pretty (T.replace "'" "''" t) <> "'"
     render' (Folded ch ind) t = render' (Literal ch ind) t
-    render' (Literal ch ind) t = do
-      i <- gets (.level)
-      let (offInd, off) = toIndOff ind
-          chompInd = renderChomp ch
-          ls = T.splitOn "\n" t
-          indent = fromIntegral i + off
-      putLit $
-        "|"
-          <> offInd
-          <> chompInd
-          <> "\n"
-          <> foldMap
-            ( \l ->
-                fromString (replicate indent ' ') <> TB.fromText l <> "\n"
-            )
-            ls
+    render' (Literal ch ind) t =
+      MultiLine <$ do
+        let (offInd, off) = toIndOff ind
+            chompInd = renderChomp ch
+        putSpaced $
+          PP.vsep
+            [ "|" <> offInd <> chompInd
+            , PP.nest off $ PP.pretty t
+            ]
 
-renderChomp :: Chomp -> TB.Builder
+renderChomp :: Chomp -> PP.Doc ()
 renderChomp Strip = "-"
 renderChomp Clip = ""
 renderChomp Keep = "+"
 
-toIndOff :: IndentOfs -> (TB.Builder, Int)
+toIndOff :: IndentOfs -> (PP.Doc (), Int)
 toIndOff = maybe ("", 2) ((,) <$> fromString . show <*> id) . fromInd
 
 fromInd :: IndentOfs -> Maybe Int
@@ -1514,7 +1593,7 @@ selectSuitableStyle l@Folded {} t =
     else l
 
 data ObjectStatus = ObjectStatus
-  { objects :: Map T.Text (Maybe T.Text, Printer 'Value ())
+  { objects :: Map T.Text (Maybe T.Text, Printer LineCount)
   , anyComments :: !Any
   }
   deriving (Generic)
@@ -1546,7 +1625,7 @@ collectObjects = fmap W.execWriter . go
         W.tell $
           ObjectStatus
             { objects =
-                Map.singleton f (mcomm, maybe putNull (prettyValue v) p)
+                Map.singleton f (mcomm, maybe (SingleLine <$ putNull) (prettyValue v) p)
             , anyComments = Any $ isJust mcomm
             }
       pure p
@@ -1567,123 +1646,62 @@ collectObjects = fmap W.execWriter . go
       f <- go mf v
       go f v
 
-putObject :: ObjectFormatter -> Codec 'Object i x -> i -> Printer 'Value ()
-putObject objf p i = do
-  let ObjectStatus {anyComments = Any hasComment, ..} = collectObjects p i
-      ents = sortBy (objf.keyOrdering `on` fst) $ Map.toList objects
-  lvl' <-
-    gets (.context) >>= \case
-      TopLevel -> gets (.level)
-      ExpectFieldValue _ -> gets (.level)
-      ExpectArrayElem {style = Flow, ..} -> do
-        when (index > 0) $ Printer $ tell ", "
-        gets (.level)
-      ExpectArrayElem {style = Block} -> do
-        putIndent
-        Printer $ tell "- "
-        gets ((+ 2) . (.level))
-  case objf.style of
-    Flow -> do
-      Printer $ tell "{"
-      when hasComment $ Printer $ tell " "
-    Block -> newLine >> putIndent
-  let env' =
-        PrintEnv
-          { level = lvl'
-          , context = ExpectFieldLabel objf.style NoComment
-          }
-  localState env' $ go hasComment ents
-  case objf.style of
-    Flow -> do
-      Printer $ tell "}"
-      newLine
-    Block -> newLine
+putObject :: ObjectFormatter -> Codec 'Object i x -> i -> Printer LineCount
+putObject objf p = putObjectLike objf . collectObjects p
+
+putObjectLike :: ObjectFormatter -> ObjectStatus -> Printer LineCount
+putObjectLike opts ObjectStatus {anyComments = Any hasComment, ..} = do
+  go opts.style
   where
-    go hasComment ents = do
-      lvl <- fromIntegral <$> gets (.level)
-      let indent = Printer $ tell $ fromString (replicate lvl ' ')
-          newl = Printer $ tell "\n"
-      void $
-        foldlM
-          ( \ !isTail (lab, (mcomm, printer)) -> do
-              when isTail $ case objf.style of
-                Flow -> do
-                  when hasComment indent
-                  Printer $ tell ", "
-                Block -> indent
-              forM_ mcomm $
-                T.lines >>> mapM_ \l -> do
-                  Printer $ tell $ "# " <> TB.fromText l
-                  newl
-                  indent
-              when (objf.style == Flow && isTail) $ Printer $ tell ", "
-              Printer $ tell $ TB.fromText lab <> ": "
-              let env'' =
-                    PrintEnv
-                      { level = fromIntegral lvl + 2
-                      , context = ExpectFieldValue objf.style
-                      }
-              localState env'' printer
-              if objf.style == Flow && not hasComment
-                then Printer $ tell ", "
-                else newl
-              pure True
-          )
-          False
-          ents
+    ents = sortBy (opts.keyOrdering `on` fst) $ Map.toList objects
+    go Block = do
+      aligned $
+        vsepped $ flip map ents \(f, (mcomm, p)) -> do
+          mapM_ putComment mcomm
+          putDirect $ PP.pretty f <> PP.colon
+          indentedIfMultiline 2 p
+      pure MultiLine
+    go Flow = do
+      when hasComment $ putDirect PP.line
+      let commad
+            | hasComment = vcommaSepped
+            | otherwise = hcommaSepped
+      braced $
+        commad
+          [ do
+            mapM_ putComment mcomm
+            putDirect $ PP.pretty f <> ":"
+            nestedIfMultiline 2 p
+          | (f, (mcomm, p)) <- ents
+          ]
 
-putArray :: BlockFormatter -> Codec 'Value i o -> V.Vector i -> Printer 'Value ()
-putArray fmt p v = do
-  i0 <- gets (.level)
-  let env' =
-        PrintEnv
-          { level = i0
-          , context = ExpectArrayElem {style = fmt.style, index = 0}
-          }
-  case fmt.style of
-    Flow -> do
-      Printer $ tell "["
-      localState env' $ V.mapM_ (prettyValue p) v
-      Printer $ tell "]"
-    Block -> do
-      localState env' $ V.mapM_ (prettyValue p) v
+putComment :: T.Text -> Printer ()
+putComment comm = forM_ (T.lines comm) \l -> do
+  putDirect $ "# " <> PP.pretty l
+  putDirect PP.line
 
-newLine :: Printer 'Value ()
-newLine = Printer $ tell "\n"
-
-putIndent :: Printer ctx ()
-putIndent = Printer . tell . fromString . flip replicate ' ' . fromIntegral =<< gets (.level)
-
-putLit :: TB.Builder -> Printer 'Value ()
-putLit x =
-  gets (.context) >>= \case
-    TopLevel -> Printer $ tell $ x <> "\n"
-    ExpectFieldValue _ -> Printer $ tell x
-    ExpectArrayElem {..} -> do
-      case style of
-        Flow
-          | index > 0 -> Printer $ tell $ ", " <> x
-          | otherwise -> Printer $ tell x
-        Block -> do
-          putIndent
-          Printer $ tell $ "- " <> x <> "\n"
-      modify $ \env -> env {context = ExpectArrayElem {index = index + 1, ..}}
-
-prettyJSON :: ValueFormatters -> J.Value -> Printer 'Value ()
-prettyJSON _ J.Null = putNull
-prettyJSON opts (J.Object dic) = putJSONObject' opts.object dic
-prettyJSON opts (J.Array dic) = putJSONArray' opts.array dic
+prettyJSON :: ValueFormatters -> J.Value -> Printer LineCount
+prettyJSON _ J.Null = SingleLine <$ putNull
+prettyJSON opts (J.Object dic) = putJSONObject' opts dic
+prettyJSON opts (J.Array dic) = putJSONArray' opts dic
 prettyJSON opts (J.String txt) = putText opts.text txt
 prettyJSON opts (J.Number n) = case floatingOrInteger @Double n of
   Left {} -> putFloat opts.float n
   Right i -> putInteger i
-prettyJSON _ (J.Bool b) = putBool b
+prettyJSON _ (J.Bool b) = SingleLine <$ putBool b
 
-putInteger :: Integer -> Printer 'Value ()
-putInteger = putLit . fromString . show
+putInteger :: Integer -> Printer LineCount
+putInteger = (SingleLine <$) . putSpaced . fromString . show
 
-putJSONArray' :: BlockFormatter -> J.Array -> Printer 'Value ()
-putJSONArray' = undefined
+putJSONArray' :: ValueFormatters -> J.Array -> Printer LineCount
+putJSONArray' opts arr =
+  putArrayLike opts.array.style $ V.toList $ V.map (prettyJSON opts) arr
 
-putJSONObject' :: ObjectFormatter -> J.Object -> Printer 'Value ()
-putJSONObject' = undefined
+putJSONObject' :: ValueFormatters -> J.Object -> Printer LineCount
+putJSONObject' opts dic =
+  putObjectLike
+    opts.object
+    ObjectStatus
+      { objects = AKM.toMapText $ fmap ((Nothing,) . prettyJSON opts) dic
+      , anyComments = Any False
+      }

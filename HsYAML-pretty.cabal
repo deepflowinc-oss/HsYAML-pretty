@@ -48,7 +48,7 @@ common defaults
 
 library
   import: defaults
-  -- cabal-gild: discover src
+  -- cabal-gild: discover src --include=src/**/*.hs
   exposed-modules: Data.YAML.Pretty
   hs-source-dirs: src
   build-depends:
@@ -63,6 +63,7 @@ library
     lens,
     mtl,
     pointed,
+    prettyprinter,
     profunctors,
     scientific,
     selective,
@@ -74,7 +75,7 @@ library
 executable HsYAML-pretty-exe
   import: defaults
   main-is: Main.hs
-  -- cabal-gild: discover app --exclude=app/Main.hs
+  -- cabal-gild: discover --include=app/**/*.hs --exclude=app/Main.hs
   other-modules:
   hs-source-dirs: app
   build-depends: HsYAML-pretty
@@ -88,7 +89,7 @@ test-suite HsYAML-pretty-test
   import: defaults
   type: exitcode-stdio-1.0
   main-is: Test.hs
-  -- cabal-gild: discover test --exclude=test/Test.hs
+  -- cabal-gild: discover test --include=test/**/*.hs --exclude=test/Test.hs
   other-modules:
   hs-source-dirs: test
   ghc-options:
