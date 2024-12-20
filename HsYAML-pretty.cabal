@@ -1,9 +1,9 @@
 cabal-version: 3.0
 name: HsYAML-pretty
 version: 0.1.0.0
-description: Please see the README on GitHub at <https://github.com/deepflowinc/HsYAML-pretty#readme>
-homepage: https://github.com/deepflowinc/HsYAML-pretty#readme
-bug-reports: https://github.com/deepflowinc/HsYAML-pretty/issues
+description: Please see the README on GitHub at <https://github.com/deepflowinc-oss/HsYAML-pretty#readme>
+homepage: https://github.com/deepflowinc-oss/HsYAML-pretty#readme
+bug-reports: https://github.com/deepflowinc-oss/HsYAML-pretty/issues
 category: Text
 synopsis: Fine-grained pretty-printer and decoder for HsYAML, ala autodocodec.
 author: DeepFlow, Inc.
@@ -24,7 +24,7 @@ extra-doc-files:
 
 source-repository head
   type: git
-  location: https://github.com/deepflowinc/HsYAML-pretty
+  location: https://github.com/deepflowinc-oss/HsYAML-pretty
 
 common defaults
   other-modules: Paths_HsYAML_pretty
